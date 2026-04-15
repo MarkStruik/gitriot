@@ -22,6 +22,10 @@
 - At the end of each completed implementation phase, produce a Windows executable at `publish/gitriot.exe`.
 - The `publish/` directory is intentionally excluded from Git tracking.
 
+## Current Status Notes
+- Step 1 scaffolding has started (`go.mod`, `cmd/gitriot/main.go`, `internal/app/model.go`).
+- Finalizing Step 1 and generating `publish/gitriot.exe` is currently blocked because the Go toolchain (`go`) is not installed in this environment.
+
 ## Delivery Workflow
 1. Complete one step from the tracker.
 2. Build executable to `publish/gitriot.exe`.
