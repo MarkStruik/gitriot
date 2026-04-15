@@ -6,11 +6,17 @@ GitRiot is a keyboard-first terminal diff command center for Git repositories an
 - Unified change list for root repo and submodules
 - Staged, unstaged, untracked, and submodule filtering
 - Split-pane TUI with file list and diff viewport
+- Optional recent commit snapshot across root + submodules by timeframe
 - File-based theme loading from `~/.gitriot/themes`
 
 ## Run (Docker toolchain)
 ```bash
 docker run --rm -it -v "${PWD}:/src" -w /src golang:1.24 sh -c "go run ./cmd/gitriot --repo ."
+```
+
+Run with recent commit window enabled:
+```bash
+docker run --rm -it -v "${PWD}:/src" -w /src golang:1.24 sh -c "go run ./cmd/gitriot --repo . --recent-window 2h"
 ```
 
 ## Build Windows executable
@@ -51,6 +57,7 @@ colors:
 - `u`: toggle unstaged changes
 - `n`: toggle untracked changes
 - `m`: toggle submodule changes
+- `c`: toggle recent commit snapshot view (requires `--recent-window`)
 - `/`: open search input
 - `esc`: close search input
 - `r`: refresh index
@@ -58,3 +65,4 @@ colors:
 ## Notes
 - GitRiot currently shells out to native Git CLI commands.
 - Submodule failures are reported as warnings; the app remains interactive.
+- Recent commit view is anchored to the root repository last commit and includes submodules whose last commit time is within the provided window.

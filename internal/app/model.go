@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,8 +30,9 @@ const (
 )
 
 type Option struct {
-	RepoPath string
-	Theme    theme.FileTheme
+	RepoPath     string
+	Theme        theme.FileTheme
+	RecentWindow time.Duration
 }
 
 type Model struct {
@@ -45,6 +47,9 @@ type Model struct {
 
 	allItems      []model.ChangeItem
 	filteredItems []model.ChangeItem
+	recentCommits []model.RepoCommit
+	recentWindow  time.Duration
+	showRecent    bool
 
 	changes list.Model
 	diff    viewport.Model
@@ -75,6 +80,7 @@ type indexLoadedMsg struct {
 	requestID int
 	branch    string
 	result    git.IndexResult
+	recent    git.RecentCommitResult
 	err       error
 }
 
@@ -96,6 +102,7 @@ type keyMap struct {
 	FilterUntracked key.Binding
 	FilterSubmodule key.Binding
 	Search          key.Binding
+	ToggleRecent    key.Binding
 	CloseSearch     key.Binding
 	Up              key.Binding
 	Down            key.Binding
@@ -104,14 +111,14 @@ type keyMap struct {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.FocusSwitch, k.Open, k.Search, k.Refresh, k.Quit}
+	return []key.Binding{k.FocusSwitch, k.Open, k.ToggleRecent, k.Search, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.FocusSwitch},
 		{k.FilterStaged, k.FilterUnstaged, k.FilterUntracked, k.FilterSubmodule},
-		{k.Search, k.CloseSearch, k.Refresh, k.Quit},
+		{k.ToggleRecent, k.Search, k.CloseSearch, k.Refresh, k.Quit},
 	}
 }
 
@@ -124,6 +131,7 @@ var keys = keyMap{
 	FilterUnstaged:  key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "toggle unstaged")),
 	FilterUntracked: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "toggle untracked")),
 	FilterSubmodule: key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle submodule")),
+	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "toggle commits")),
 	Search:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
 	CloseSearch:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "close search")),
 	Up:              key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
@@ -134,9 +142,18 @@ var keys = keyMap{
 
 func NewModel(opt Option) Model {
 	runner := git.NewCLIRunner()
-	changes := list.New(nil, list.NewDefaultDelegate(), 0, 0)
+	delegate := list.NewDefaultDelegate()
+	delegate.SetHeight(1)
+	delegate.SetSpacing(0)
+	delegate.ShowDescription = false
+	delegate.Styles.NormalTitle = lipgloss.NewStyle().Foreground(lipgloss.Color(opt.Theme.Colors.Fg))
+	delegate.Styles.SelectedTitle = lipgloss.NewStyle().Foreground(lipgloss.Color(opt.Theme.Colors.Accent)).Bold(true)
+	changes := list.New(nil, delegate, 0, 0)
 	changes.Title = "Changes"
+	changes.SetShowTitle(false)
 	changes.SetShowStatusBar(false)
+	changes.SetShowPagination(false)
+	changes.SetShowHelp(false)
 	changes.SetFilteringEnabled(false)
 
 	d := viewport.New(0, 0)
@@ -151,18 +168,19 @@ func NewModel(opt Option) Model {
 	h.ShowAll = false
 
 	return Model{
-		repoPath: filepath.Clean(opt.RepoPath),
-		styles:   ui.NewStyles(opt.Theme),
-		filters:  DefaultFilters(),
-		runner:   runner,
-		index:    git.NewRepositoryIndexer(runner),
-		diffs:    git.NewDiffLoader(runner),
-		changes:  changes,
-		diff:     d,
-		help:     h,
-		search:   s,
-		focus:    focusChanges,
-		message:  "Loading repository status...",
+		repoPath:     filepath.Clean(opt.RepoPath),
+		styles:       ui.NewStyles(opt.Theme),
+		filters:      DefaultFilters(),
+		runner:       runner,
+		index:        git.NewRepositoryIndexer(runner),
+		diffs:        git.NewDiffLoader(runner),
+		changes:      changes,
+		diff:         d,
+		help:         h,
+		search:       s,
+		focus:        focusChanges,
+		message:      "Loading repository status...",
+		recentWindow: opt.RecentWindow,
 	}
 }
 
@@ -220,7 +238,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.branch = msg.branch
 		m.warn = msg.result.Warnings
+		m.warn = append(m.warn, msg.recent.Warnings...)
 		m.allItems = msg.result.Items
+		m.recentCommits = msg.recent.Commits
 		m.applyFiltersToList()
 		m.message = fmt.Sprintf("Loaded %d changes", len(m.allItems))
 		return m, nil
@@ -255,6 +275,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focus = focusSearch
 			m.search.Focus()
 			return m, textinput.Blink
+		case key.Matches(msg, keys.ToggleRecent):
+			if m.recentWindow <= 0 {
+				m.message = "Recent commit view disabled; use --recent-window"
+				return m, nil
+			}
+			m.showRecent = !m.showRecent
+			if m.showRecent {
+				m.message = "Showing recent commit snapshot"
+			} else {
+				m.message = "Showing diff view"
+			}
+			return m, nil
 		case key.Matches(msg, keys.Refresh):
 			return m, m.loadIndexCmd()
 		case key.Matches(msg, keys.FilterStaged):
@@ -274,6 +306,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.applyFiltersToList()
 			return m, nil
 		case key.Matches(msg, keys.Open):
+			m.showRecent = false
 			item := m.selectedItem()
 			if item == nil {
 				return m, nil
@@ -337,6 +370,9 @@ func (m *Model) rotateFocus() {
 func (m *Model) renderTopBar() string {
 	filters := fmt.Sprintf("S:%t U:%t N:%t M:%t", m.filters.ShowStaged, m.filters.ShowUnstaged, m.filters.ShowUntracked, m.filters.ShowSubmodule)
 	status := fmt.Sprintf("repo: %s | branch: %s | visible: %d/%d | %s", m.repoPath, valueOr(m.branch, "?"), len(m.filteredItems), len(m.allItems), filters)
+	if m.recentWindow > 0 {
+		status += fmt.Sprintf(" | recent: %d (%s)", len(m.recentCommits), formatDuration(m.recentWindow))
+	}
 	if len(m.warn) > 0 {
 		status += fmt.Sprintf(" | warnings: %d", len(m.warn))
 	}
@@ -364,13 +400,22 @@ func (m *Model) renderChangesPane() string {
 }
 
 func (m *Model) renderDiffPane() string {
-	title := m.styles.Title.Render("Diff")
+	titleText := "Diff"
+	if m.showRecent {
+		titleText = "Recent Commits"
+	}
+	title := m.styles.Title.Render(titleText)
 	pane := m.styles.Pane
 	if m.focus == focusDiff {
 		pane = m.styles.PaneActive
 	}
 
-	return pane.Width(maxInt(m.width-maxInt(m.width/3, 30)-1, 40)).Height(maxInt(m.height-3, 8)).Render(lipgloss.JoinVertical(lipgloss.Left, title, m.diff.View()))
+	body := m.diff.View()
+	if m.showRecent {
+		body = m.renderRecentCommits()
+	}
+
+	return pane.Width(maxInt(m.width-maxInt(m.width/3, 30)-1, 40)).Height(maxInt(m.height-3, 8)).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
 }
 
 func (m *Model) renderBottomBar() string {
@@ -394,11 +439,18 @@ func (m *Model) loadIndexCmd() tea.Cmd {
 
 		branch, branchErr := git.CurrentBranch(ctx, m.runner, repoPath)
 		result, err := m.index.IndexAll(ctx, repoPath)
+		recent, recentErr := git.RecentCommitResult{}, error(nil)
+		if m.recentWindow > 0 {
+			recent, recentErr = git.CollectRecentCommits(ctx, m.runner, repoPath, m.recentWindow)
+		}
 		if branchErr != nil && err == nil {
 			result.Warnings = append(result.Warnings, branchErr.Error())
 		}
+		if recentErr != nil && err == nil {
+			result.Warnings = append(result.Warnings, "recent commits unavailable: "+recentErr.Error())
+		}
 
-		return indexLoadedMsg{requestID: requestID, branch: branch, result: result, err: err}
+		return indexLoadedMsg{requestID: requestID, branch: branch, result: result, recent: recent, err: err}
 	}
 }
 
@@ -506,4 +558,60 @@ func valueOr(v string, fallback string) string {
 	}
 
 	return v
+}
+
+func (m *Model) renderRecentCommits() string {
+	if m.recentWindow <= 0 {
+		return m.styles.Muted.Render("Recent commit view is disabled. Start with --recent-window (example: --recent-window 2h).")
+	}
+
+	if len(m.recentCommits) == 0 {
+		return m.styles.Muted.Render("No commits found in the selected window.")
+	}
+
+	commits := make([]model.RepoCommit, len(m.recentCommits))
+	copy(commits, m.recentCommits)
+	sort.Slice(commits, func(i int, j int) bool {
+		return commits[i].When.After(commits[j].When)
+	})
+
+	b := strings.Builder{}
+	b.WriteString(m.styles.Muted.Render("Recent commit snapshot (root + submodules within window):"))
+	b.WriteByte('\n')
+	b.WriteByte('\n')
+
+	for _, commit := range commits {
+		scope := commit.Scope
+		if commit.IsRoot {
+			scope = "root"
+		}
+
+		header := fmt.Sprintf("[%s] %s  %s  %s", scope, shortHash(commit.Hash), commit.When.Local().Format(time.RFC3339), commit.Author)
+		b.WriteString(m.styles.DiffMeta.Render(header))
+		b.WriteByte('\n')
+		b.WriteString(m.styles.DiffNormal.Render("  " + commit.Subject))
+		b.WriteByte('\n')
+		b.WriteByte('\n')
+	}
+
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func shortHash(hash string) string {
+	if len(hash) <= 8 {
+		return hash
+	}
+
+	return hash[:8]
+}
+
+func formatDuration(d time.Duration) string {
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+
+	return d.String()
 }

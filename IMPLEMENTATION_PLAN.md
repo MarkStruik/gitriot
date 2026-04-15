@@ -36,6 +36,10 @@
 - Steps 9-13 completed with split-pane Bubble Tea UI, keyboard controls, async refresh, and warning-tolerant indexing in `internal/app/model.go`.
 - Step 14 completed with CLI startup wiring and flags in `cmd/gitriot/main.go`.
 - Step 15 completed with tests and docs in `internal/*/*_test.go`, `README.md`, and `RELEASE_NOTES.md`.
+- Added post-plan enhancement: recent commit snapshot across root + submodules with `--recent-window` and `c` toggle.
+
+## Requested Future Features
+- Add a coordinated "commit all" workflow that can commit root repository and submodules in one guided action.
 
 ## Delivery Workflow
 1. Complete one step from the tracker.

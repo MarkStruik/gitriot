@@ -16,6 +16,7 @@ func main() {
 	repoFlag := flag.String("repo", ".", "Path to repository root")
 	themeFlag := flag.String("theme", "", "Theme name from ~/.gitriot/themes")
 	themeFileFlag := flag.String("theme-file", "", "Absolute path to theme YAML file")
+	recentWindowFlag := flag.Duration("recent-window", 0, "Time window around root last commit (example: 90m, 2h)")
 	flag.Parse()
 
 	paths, err := config.ResolvePaths()
@@ -57,7 +58,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(app.NewModel(app.Option{RepoPath: repoPath, Theme: selectedTheme}), tea.WithAltScreen())
+	if *recentWindowFlag < 0 {
+		fmt.Fprintf(os.Stderr, "invalid recent-window %s: must be >= 0\n", (*recentWindowFlag).String())
+		os.Exit(1)
+	}
+
+	modelOption := app.Option{
+		RepoPath:     repoPath,
+		Theme:        selectedTheme,
+		RecentWindow: *recentWindowFlag,
+	}
+
+	p := tea.NewProgram(app.NewModel(modelOption), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to run GitRiot: %v\n", err)
 		os.Exit(1)
