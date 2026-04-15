@@ -596,7 +596,8 @@ func (m *Model) loadIndexCmd() tea.Cmd {
 func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 	m.requestID++
 	requestID := m.requestID
-	m.activeRef = item.ScopeLabel() + "/" + item.Path
+	activeRef := item.ScopeLabel() + "/" + item.Path
+	m.activeRef = activeRef
 	req := model.DiffRequest{
 		RepoRoot:      m.repoPath,
 		Path:          item.Path,
@@ -624,7 +625,7 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 			return diffLoadedMsg{requestID: requestID, err: fullErr}
 		}
 
-		view := renderFileWithHunks(full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
+		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
 		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
 	}
 }
@@ -828,7 +829,8 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 	if file.IsRoot {
 		scope = "root"
 	}
-	m.activeRef = fmt.Sprintf("%s/%s @%s", scope, file.Path, shortHash(file.CommitHash))
+	activeRef := fmt.Sprintf("%s/%s @%s", scope, file.Path, shortHash(file.CommitHash))
+	m.activeRef = activeRef
 	req := git.CommitDiffRequest{
 		RepoRoot:      m.repoPath,
 		SubmodulePath: file.SubmodulePath,
@@ -855,7 +857,7 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 			return diffLoadedMsg{requestID: requestID, err: fullErr}
 		}
 
-		view := renderFileWithHunks(full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
+		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
 		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
 	}
 }
