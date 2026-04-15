@@ -21,3 +21,11 @@ type ChangeItem struct {
 func (c ChangeItem) IsSubmodule() bool {
 	return c.SubmodulePath != ""
 }
+
+func (c ChangeItem) ScopeLabel() string {
+	if c.SubmodulePath == "" {
+		return "root"
+	}
+
+	return c.SubmodulePath
+}
