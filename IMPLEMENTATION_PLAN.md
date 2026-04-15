@@ -6,7 +6,7 @@
 - [x] Step 2: Define core domain models for changes and diffs
 - [x] Step 3: Build Git command runner abstraction
 - [x] Step 4: Implement main repository status indexer
-- [ ] Step 5: Implement submodule discovery and indexing
+- [x] Step 5: Implement submodule discovery and indexing
 - [ ] Step 6: Build diff loading service (staged/unstaged)
 - [ ] Step 7: Add theme token system (single theme, extensible)
 - [ ] Step 8: Add config + file-based theme loading (`~/.gitriot`)
@@ -29,6 +29,7 @@
 - Step 2 completed with shared domain models in `internal/model/change.go` and `internal/model/diff.go`.
 - Step 3 completed with Git CLI runner abstraction in `internal/git/runner.go`.
 - Step 4 completed with porcelain status parsing in `internal/git/status.go`.
+- Step 5 completed with combined repo/submodule indexing in `internal/git/repository_indexer.go`.
 
 ## Delivery Workflow
 1. Complete one step from the tracker.
