@@ -7,8 +7,8 @@ import (
 )
 
 type Model struct {
-	ready bool
-	width int
+	ready  bool
+	width  int
 	height int
 }
 

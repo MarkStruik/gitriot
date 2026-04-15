@@ -2,9 +2,9 @@
 
 ## Todo Tracker
 - [x] Step 0: Persist implementation plan and initialize Git repository
-- [ ] Step 1: Bootstrap Go module and Bubble Tea app skeleton
-- [ ] Step 2: Define core domain models for changes and diffs
-- [ ] Step 3: Build Git command runner abstraction
+- [x] Step 1: Bootstrap Go module and Bubble Tea app skeleton
+- [x] Step 2: Define core domain models for changes and diffs
+- [x] Step 3: Build Git command runner abstraction
 - [ ] Step 4: Implement main repository status indexer
 - [ ] Step 5: Implement submodule discovery and indexing
 - [ ] Step 6: Build diff loading service (staged/unstaged)
@@ -23,8 +23,11 @@
 - The `publish/` directory is intentionally excluded from Git tracking.
 
 ## Current Status Notes
-- Step 1 scaffolding has started (`go.mod`, `cmd/gitriot/main.go`, `internal/app/model.go`).
-- Finalizing Step 1 and generating `publish/gitriot.exe` is currently blocked because the Go toolchain (`go`) is not installed in this environment.
+- Step 1 completed with Bubble Tea shell scaffolding in `cmd/gitriot/main.go` and `internal/app/model.go`.
+- Phase artifact generated: `publish/gitriot.exe`.
+- Build is executed in Docker using `golang:1.24` to stay aligned with the latest toolchain baseline.
+- Step 2 completed with shared domain models in `internal/model/change.go` and `internal/model/diff.go`.
+- Step 3 completed with Git CLI runner abstraction in `internal/git/runner.go`.
 
 ## Delivery Workflow
 1. Complete one step from the tracker.
