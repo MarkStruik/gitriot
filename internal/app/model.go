@@ -227,6 +227,7 @@ func NewModel(opt Option) Model {
 		focus:         focusChanges,
 		message:       "Loading repository status...",
 		recentWindow:  opt.RecentWindow,
+		showHunksOnly: true,
 		selectedTree:  -1,
 		scopeBranches: map[string]string{},
 		treeCollapsed: map[string]bool{},
