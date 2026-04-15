@@ -12,6 +12,7 @@ import (
 
 type RecentCommitResult struct {
 	Commits  []model.RepoCommit
+	Files    []model.CommitFile
 	Warnings []string
 }
 
@@ -22,6 +23,13 @@ func CollectRecentCommits(ctx context.Context, runner Runner, repoRoot string, w
 	}
 
 	result := RecentCommitResult{Commits: []model.RepoCommit{rootCommit}}
+	rootFiles, err := commitFiles(ctx, runner, rootCommit)
+	if err != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("root commit file list unavailable: %v", err))
+	} else {
+		result.Files = append(result.Files, rootFiles...)
+	}
+
 	if window <= 0 {
 		return result, nil
 	}
@@ -41,6 +49,12 @@ func CollectRecentCommits(ctx context.Context, runner Runner, repoRoot string, w
 
 		if withinWindow(rootCommit.When, commit.When, window) {
 			result.Commits = append(result.Commits, commit)
+			files, filesErr := commitFiles(ctx, runner, commit)
+			if filesErr != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("submodule %q commit file list unavailable: %v", submodulePath, filesErr))
+				continue
+			}
+			result.Files = append(result.Files, files...)
 		}
 	}
 
@@ -82,4 +96,44 @@ func withinWindow(anchor time.Time, candidate time.Time, window time.Duration) b
 	}
 
 	return delta <= window
+}
+
+func commitFiles(ctx context.Context, runner Runner, commit model.RepoCommit) ([]model.CommitFile, error) {
+	out, err := runner.Run(ctx, commit.RepoPath, "show", "--pretty=format:", "--name-only", commit.Hash)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(out, "\n")
+	files := make([]model.CommitFile, 0, len(lines))
+	seen := make(map[string]struct{})
+	for _, raw := range lines {
+		path := strings.TrimSpace(raw)
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+
+		submodulePath := ""
+		if !commit.IsRoot {
+			submodulePath = commit.Scope
+		}
+
+		files = append(files, model.CommitFile{
+			Scope:         commit.Scope,
+			CommitHash:    commit.Hash,
+			Path:          path,
+			Subject:       commit.Subject,
+			When:          commit.When,
+			Author:        commit.Author,
+			IsRoot:        commit.IsRoot,
+			RepoPath:      commit.RepoPath,
+			SubmodulePath: submodulePath,
+		})
+	}
+
+	return files, nil
 }

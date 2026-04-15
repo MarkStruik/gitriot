@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -48,6 +47,8 @@ type Model struct {
 	allItems      []model.ChangeItem
 	filteredItems []model.ChangeItem
 	recentCommits []model.RepoCommit
+	recentFiles   []model.CommitFile
+	recentVisible []model.CommitFile
 	recentWindow  time.Duration
 	showRecent    bool
 
@@ -66,6 +67,8 @@ type Model struct {
 	warn    []string
 
 	requestID int
+	lastSelID string
+	activeRef string
 }
 
 type changeListItem struct {
@@ -75,6 +78,23 @@ type changeListItem struct {
 func (c changeListItem) Title() string       { return fmt.Sprintf("[%s] %s", c.change.Type, c.change.Path) }
 func (c changeListItem) Description() string { return c.change.ScopeLabel() }
 func (c changeListItem) FilterValue() string { return c.change.ScopeLabel() + "/" + c.change.Path }
+
+type recentFileListItem struct {
+	file model.CommitFile
+}
+
+func (r recentFileListItem) Title() string {
+	scope := r.file.Scope
+	if r.file.IsRoot {
+		scope = "root"
+	}
+	return fmt.Sprintf("[%s %s] %s", scope, shortHash(r.file.CommitHash), r.file.Path)
+}
+
+func (r recentFileListItem) Description() string { return r.file.Subject }
+func (r recentFileListItem) FilterValue() string {
+	return strings.ToLower(r.file.Scope + "/" + r.file.Path + " " + r.file.Subject)
+}
 
 type indexLoadedMsg struct {
 	requestID int
@@ -111,7 +131,7 @@ type keyMap struct {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.FocusSwitch, k.Open, k.ToggleRecent, k.Search, k.Quit}
+	return []key.Binding{k.FocusSwitch, k.ToggleRecent, k.Search, k.Refresh, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
@@ -126,7 +146,7 @@ var keys = keyMap{
 	Quit:            key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	Refresh:         key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 	FocusSwitch:     key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch pane")),
-	Open:            key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "load diff")),
+	Open:            key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "reload diff")),
 	FilterStaged:    key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "toggle staged")),
 	FilterUnstaged:  key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "toggle unstaged")),
 	FilterUntracked: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "toggle untracked")),
@@ -195,16 +215,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(keyMsg, keys.CloseSearch):
 				m.focus = focusChanges
 				m.search.Blur()
-				m.applyFiltersToList()
+				m.applyCurrentList()
 				return m, nil
 			case keyMsg.Type == tea.KeyEnter:
 				m.focus = focusChanges
 				m.search.Blur()
-				m.applyFiltersToList()
+				m.applyCurrentList()
 				return m, nil
 			default:
 				m.filters.Query = m.search.Value()
-				m.applyFiltersToList()
+				m.applyCurrentList()
 				return m, cmd
 			}
 		}
@@ -239,8 +259,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.warn = append(m.warn, msg.recent.Warnings...)
 		m.allItems = msg.result.Items
 		m.recentCommits = msg.recent.Commits
-		m.applyFiltersToList()
-		m.message = fmt.Sprintf("Loaded %d changes", len(m.allItems))
+		m.recentFiles = msg.recent.Files
+		if len(m.allItems) == 0 && m.recentWindow > 0 {
+			m.showRecent = true
+		}
+		m.applyCurrentList()
+		if m.showRecent {
+			m.diff.SetContent(m.renderRecentSummary())
+			m.activeRef = "recent snapshot"
+			m.message = fmt.Sprintf("Loaded %d files from recent commits", len(m.recentVisible))
+			if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+				return m, cmd
+			}
+		} else {
+			m.activeRef = ""
+			m.message = fmt.Sprintf("Loaded %d changes", len(m.allItems))
+			if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+				return m, cmd
+			}
+		}
 		return m, nil
 	case diffLoadedMsg:
 		if msg.requestID != m.requestID {
@@ -280,31 +317,48 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.showRecent = !m.showRecent
 			if m.showRecent {
-				m.message = "Showing recent commit snapshot"
+				m.applyCurrentList()
+				m.diff.SetContent(m.renderRecentSummary())
+				m.activeRef = "recent snapshot"
+				m.message = fmt.Sprintf("Showing %d recent commit files", len(m.recentVisible))
+				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+					return m, cmd
+				}
 			} else {
+				m.applyCurrentList()
+				m.activeRef = ""
 				m.message = "Showing diff view"
+				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+					return m, cmd
+				}
 			}
 			return m, nil
 		case key.Matches(msg, keys.Refresh):
 			return m, m.loadIndexCmd()
 		case key.Matches(msg, keys.FilterStaged):
 			m.filters.ShowStaged = !m.filters.ShowStaged
-			m.applyFiltersToList()
+			m.applyCurrentList()
 			return m, nil
 		case key.Matches(msg, keys.FilterUnstaged):
 			m.filters.ShowUnstaged = !m.filters.ShowUnstaged
-			m.applyFiltersToList()
+			m.applyCurrentList()
 			return m, nil
 		case key.Matches(msg, keys.FilterUntracked):
 			m.filters.ShowUntracked = !m.filters.ShowUntracked
-			m.applyFiltersToList()
+			m.applyCurrentList()
 			return m, nil
 		case key.Matches(msg, keys.FilterSubmodule):
 			m.filters.ShowSubmodule = !m.filters.ShowSubmodule
-			m.applyFiltersToList()
+			m.applyCurrentList()
 			return m, nil
 		case key.Matches(msg, keys.Open):
-			m.showRecent = false
+			if m.showRecent {
+				file := m.selectedRecentFile()
+				if file == nil {
+					return m, nil
+				}
+				return m, m.loadCommitDiffCmd(*file)
+			}
 			item := m.selectedItem()
 			if item == nil {
 				return m, nil
@@ -315,7 +369,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	if m.focus == focusChanges {
+		before := m.currentSelectionID()
 		m.changes, cmd = m.changes.Update(msg)
+		after := m.currentSelectionID()
+		if after != "" && after != before {
+			autoCmd := m.autoLoadSelectedDiff()
+			if autoCmd != nil {
+				if cmd != nil {
+					return m, tea.Batch(cmd, autoCmd)
+				}
+				return m, autoCmd
+			}
+		}
 	} else {
 		m.diff, cmd = m.diff.Update(msg)
 	}
@@ -365,7 +430,11 @@ func (m *Model) rotateFocus() {
 
 func (m *Model) renderTopBar() string {
 	filters := fmt.Sprintf("S:%t U:%t N:%t M:%t", m.filters.ShowStaged, m.filters.ShowUnstaged, m.filters.ShowUntracked, m.filters.ShowSubmodule)
-	status := fmt.Sprintf("repo: %s | branch: %s | visible: %d/%d | %s", m.repoPath, valueOr(m.branch, "?"), len(m.filteredItems), len(m.allItems), filters)
+	visible, total := len(m.filteredItems), len(m.allItems)
+	if m.showRecent {
+		visible, total = len(m.recentVisible), len(m.recentFiles)
+	}
+	status := fmt.Sprintf("repo: %s | branch: %s | visible: %d/%d | %s", m.repoPath, valueOr(m.branch, "?"), visible, total, filters)
 	if m.recentWindow > 0 {
 		status += fmt.Sprintf(" | recent: %d (%s)", len(m.recentCommits), formatDuration(m.recentWindow))
 	}
@@ -378,7 +447,11 @@ func (m *Model) renderTopBar() string {
 }
 
 func (m *Model) renderChangesPane() string {
-	title := m.styles.Title.Render("Changes")
+	titleText := "Changes"
+	if m.showRecent {
+		titleText = "Commit Files"
+	}
+	title := m.styles.Title.Render(titleText)
 	if m.loading {
 		title = title + " " + m.styles.Muted.Render("(loading)")
 	}
@@ -389,7 +462,9 @@ func (m *Model) renderChangesPane() string {
 	}
 
 	body := m.changes.View()
-	if len(m.filteredItems) == 0 {
+	if m.showRecent && len(m.recentVisible) == 0 {
+		body = m.styles.Muted.Render("No files found in recent commits")
+	} else if !m.showRecent && len(m.filteredItems) == 0 {
 		body = m.styles.Muted.Render("No changes match filters")
 	}
 
@@ -400,7 +475,10 @@ func (m *Model) renderChangesPane() string {
 func (m *Model) renderDiffPane() string {
 	titleText := "Diff"
 	if m.showRecent {
-		titleText = "Recent Commits"
+		titleText = "Commit Details"
+	}
+	if m.activeRef != "" {
+		titleText = titleText + " - " + truncateText(m.activeRef, maxInt(m.width/2, 24))
 	}
 	title := m.styles.Title.Render(titleText)
 	pane := m.styles.Pane
@@ -409,9 +487,6 @@ func (m *Model) renderDiffPane() string {
 	}
 
 	body := m.diff.View()
-	if m.showRecent {
-		body = m.renderRecentCommits()
-	}
 
 	_, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
 	return pane.Width(rightWidth).Height(paneHeight).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
@@ -456,6 +531,7 @@ func (m *Model) loadIndexCmd() tea.Cmd {
 func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 	m.requestID++
 	requestID := m.requestID
+	m.activeRef = item.ScopeLabel() + "/" + item.Path
 	req := model.DiffRequest{
 		RepoRoot:      m.repoPath,
 		Path:          item.Path,
@@ -479,6 +555,14 @@ func (m *Model) periodicRefreshCmd() tea.Cmd {
 	})
 }
 
+func (m *Model) applyCurrentList() {
+	if m.showRecent {
+		m.applyRecentFilesToList()
+		return
+	}
+	m.applyFiltersToList()
+}
+
 func (m *Model) applyFiltersToList() {
 	m.filteredItems = ApplyFilters(m.allItems, m.filters)
 	items := make([]list.Item, 0, len(m.filteredItems))
@@ -486,6 +570,32 @@ func (m *Model) applyFiltersToList() {
 		items = append(items, changeListItem{change: change})
 	}
 	m.changes.SetItems(items)
+	m.lastSelID = ""
+}
+
+func (m *Model) applyRecentFilesToList() {
+	query := strings.ToLower(strings.TrimSpace(m.filters.Query))
+	filtered := make([]model.CommitFile, 0, len(m.recentFiles))
+	for _, file := range m.recentFiles {
+		if !m.filters.ShowSubmodule && !file.IsRoot {
+			continue
+		}
+		if query != "" {
+			haystack := strings.ToLower(file.Scope + "/" + file.Path + " " + file.Subject + " " + file.Author)
+			if !strings.Contains(haystack, query) {
+				continue
+			}
+		}
+		filtered = append(filtered, file)
+	}
+	m.recentVisible = filtered
+
+	items := make([]list.Item, 0, len(filtered))
+	for _, file := range filtered {
+		items = append(items, recentFileListItem{file: file})
+	}
+	m.changes.SetItems(items)
+	m.lastSelID = ""
 }
 
 func (m *Model) selectedItem() *model.ChangeItem {
@@ -500,6 +610,21 @@ func (m *Model) selectedItem() *model.ChangeItem {
 	}
 
 	copy := v.change
+	return &copy
+}
+
+func (m *Model) selectedRecentFile() *model.CommitFile {
+	sel := m.changes.SelectedItem()
+	if sel == nil {
+		return nil
+	}
+
+	v, ok := sel.(recentFileListItem)
+	if !ok {
+		return nil
+	}
+
+	copy := v.file
 	return &copy
 }
 
@@ -559,7 +684,7 @@ func valueOr(v string, fallback string) string {
 	return v
 }
 
-func (m *Model) renderRecentCommits() string {
+func (m *Model) renderRecentSummary() string {
 	if m.recentWindow <= 0 {
 		return m.styles.Muted.Render("Recent commit view is disabled. Start with --recent-window (example: --recent-window 2h).")
 	}
@@ -568,18 +693,12 @@ func (m *Model) renderRecentCommits() string {
 		return m.styles.Muted.Render("No commits found in the selected window.")
 	}
 
-	commits := make([]model.RepoCommit, len(m.recentCommits))
-	copy(commits, m.recentCommits)
-	sort.Slice(commits, func(i int, j int) bool {
-		return commits[i].When.After(commits[j].When)
-	})
-
 	b := strings.Builder{}
-	b.WriteString(m.styles.Muted.Render("Recent commit snapshot (root + submodules within window):"))
+	b.WriteString(m.styles.Muted.Render("Recent commit snapshot. Select a file on the left to auto-load its commit diff."))
 	b.WriteByte('\n')
 	b.WriteByte('\n')
 
-	for _, commit := range commits {
+	for _, commit := range m.recentCommits {
 		scope := commit.Scope
 		if commit.IsRoot {
 			scope = "root"
@@ -594,6 +713,72 @@ func (m *Model) renderRecentCommits() string {
 	}
 
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
+	m.requestID++
+	requestID := m.requestID
+	scope := file.Scope
+	if file.IsRoot {
+		scope = "root"
+	}
+	m.activeRef = fmt.Sprintf("%s/%s @%s", scope, file.Path, shortHash(file.CommitHash))
+	req := git.CommitDiffRequest{
+		RepoRoot:      m.repoPath,
+		SubmodulePath: file.SubmodulePath,
+		CommitHash:    file.CommitHash,
+		Path:          file.Path,
+	}
+
+	m.diff.SetContent("Loading commit diff...")
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+
+		result, err := m.diffs.LoadCommit(ctx, req)
+		return diffLoadedMsg{requestID: requestID, result: result, err: err}
+	}
+}
+
+func (m *Model) autoLoadSelectedDiff() tea.Cmd {
+	selectionID := m.currentSelectionID()
+	if selectionID == "" {
+		return nil
+	}
+	if selectionID == m.lastSelID {
+		return nil
+	}
+	m.lastSelID = selectionID
+
+	if m.showRecent {
+		file := m.selectedRecentFile()
+		if file == nil {
+			return nil
+		}
+		return m.loadCommitDiffCmd(*file)
+	}
+
+	item := m.selectedItem()
+	if item == nil {
+		return nil
+	}
+	return m.loadDiffCmd(*item)
+}
+
+func (m *Model) currentSelectionID() string {
+	if m.showRecent {
+		file := m.selectedRecentFile()
+		if file == nil {
+			return ""
+		}
+		return file.Scope + "|" + file.CommitHash + "|" + file.Path
+	}
+
+	item := m.selectedItem()
+	if item == nil {
+		return ""
+	}
+	return item.ScopeLabel() + "|" + string(item.Type) + "|" + item.Path
 }
 
 func shortHash(hash string) string {
