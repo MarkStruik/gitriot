@@ -30,7 +30,7 @@ func NewStyles(t theme.FileTheme) Styles {
 			BorderForeground(lipgloss.Color(t.Colors.Border)).
 			Padding(0, 1),
 		PaneActive: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
+			Border(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color(t.Colors.Accent)).
 			Padding(0, 1),
 		Title:        lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(t.Colors.Accent)),

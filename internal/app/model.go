@@ -4,12 +4,12 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -54,11 +54,16 @@ type Model struct {
 	recentLoaded  bool
 	showHunksOnly bool
 
-	changes list.Model
-	diff    viewport.Model
-	help    help.Model
-	search  textinput.Model
-	focus   paneFocus
+	diff   viewport.Model
+	help   help.Model
+	search textinput.Model
+	focus  paneFocus
+
+	treeRows     []treeRow
+	selectedTree int
+	leftOffset   int
+	leftWidth    int
+	leftHeight   int
 
 	width  int
 	height int
@@ -74,29 +79,21 @@ type Model struct {
 	lastFingerprint string
 }
 
-type changeListItem struct {
-	change model.ChangeItem
+type treeRow struct {
+	id         string
+	text       string
+	selectable bool
+	change     *model.ChangeItem
+	commitFile *model.CommitFile
 }
 
-func (c changeListItem) Title() string       { return fmt.Sprintf("[%s] %s", c.change.Type, c.change.Path) }
-func (c changeListItem) Description() string { return c.change.ScopeLabel() }
-func (c changeListItem) FilterValue() string { return c.change.ScopeLabel() + "/" + c.change.Path }
-
-type recentFileListItem struct {
-	file model.CommitFile
-}
-
-func (r recentFileListItem) Title() string {
-	scope := r.file.Scope
-	if r.file.IsRoot {
-		scope = "root"
-	}
-	return fmt.Sprintf("[%s %s] %s", scope, shortHash(r.file.CommitHash), r.file.Path)
-}
-
-func (r recentFileListItem) Description() string { return r.file.Subject }
-func (r recentFileListItem) FilterValue() string {
-	return strings.ToLower(r.file.Scope + "/" + r.file.Path + " " + r.file.Subject)
+type treeBuildNode struct {
+	Name     string
+	Path     string
+	Folders  map[string]*treeBuildNode
+	Files    []model.ChangeItem
+	IsRoot   bool
+	ScopeKey string
 }
 
 type indexLoadedMsg struct {
@@ -179,18 +176,6 @@ var keys = keyMap{
 
 func NewModel(opt Option) Model {
 	runner := git.NewCLIRunner()
-	delegate := newChangeListDelegate(
-		lipgloss.NewStyle().Foreground(lipgloss.Color(opt.Theme.Colors.Fg)),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(opt.Theme.Colors.Accent)).Bold(true),
-	)
-	changes := list.New(nil, delegate, 0, 0)
-	changes.Title = "Changes"
-	changes.SetShowTitle(false)
-	changes.SetShowStatusBar(false)
-	changes.SetShowPagination(false)
-	changes.SetShowHelp(false)
-	changes.SetFilteringEnabled(false)
-
 	d := viewport.New(0, 0)
 	d.SetContent("Select a file to load a diff.")
 
@@ -209,13 +194,13 @@ func NewModel(opt Option) Model {
 		runner:       runner,
 		index:        git.NewRepositoryIndexer(runner),
 		diffs:        git.NewDiffLoader(runner),
-		changes:      changes,
 		diff:         d,
 		help:         h,
 		search:       s,
 		focus:        focusChanges,
 		message:      "Loading repository status...",
 		recentWindow: opt.RecentWindow,
+		selectedTree: -1,
 	}
 }
 
@@ -432,24 +417,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, m.loadDiffCmd(*item)
+		case key.Matches(msg, keys.Up):
+			if m.focus == focusChanges {
+				m.moveSelection(-1)
+				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
+		case key.Matches(msg, keys.Down):
+			if m.focus == focusChanges {
+				m.moveSelection(1)
+				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
+		case key.Matches(msg, keys.PageUp):
+			if m.focus == focusChanges {
+				m.pageSelection(-1)
+				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
+		case key.Matches(msg, keys.PageDown):
+			if m.focus == focusChanges {
+				m.pageSelection(1)
+				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
 		}
 	}
 
 	var cmd tea.Cmd
-	if m.focus == focusChanges {
-		before := m.currentSelectionID()
-		m.changes, cmd = m.changes.Update(msg)
-		after := m.currentSelectionID()
-		if after != "" && after != before {
-			autoCmd := m.autoLoadSelectedDiff()
-			if autoCmd != nil {
-				if cmd != nil {
-					return m, tea.Batch(cmd, autoCmd)
-				}
-				return m, autoCmd
-			}
-		}
-	} else {
+	if m.focus == focusDiff {
 		m.diff, cmd = m.diff.Update(msg)
 	}
 
@@ -464,7 +468,7 @@ func (m Model) View() string {
 	top := m.renderTopBar()
 	left := m.renderChangesPane()
 	right := m.renderDiffPane()
-	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 	bottom := m.renderBottomBar()
 
 	base := lipgloss.JoinVertical(lipgloss.Left, top, panes, bottom)
@@ -473,7 +477,7 @@ func (m Model) View() string {
 		base = lipgloss.JoinVertical(lipgloss.Left, base, search)
 	}
 
-	return m.styles.Frame.Width(m.width).Height(m.height).MaxWidth(m.width).MaxHeight(m.height).Render(base)
+	return m.styles.Frame.Width(m.width).Render(base)
 }
 
 func (m *Model) resize() {
@@ -484,9 +488,11 @@ func (m *Model) resize() {
 	leftWidth, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
 
 	contentHeight := maxInt(paneHeight-4, 1)
-	m.changes.SetSize(leftWidth-4, contentHeight)
+	m.leftWidth = maxInt(leftWidth-4, 8)
+	m.leftHeight = maxInt(contentHeight, 1)
 	m.diff.Width = rightWidth - 4
 	m.diff.Height = contentHeight
+	m.ensureSelectionVisible()
 }
 
 func (m *Model) rotateFocus() {
@@ -530,7 +536,7 @@ func (m *Model) renderChangesPane() string {
 		pane = m.styles.PaneActive
 	}
 
-	body := m.changes.View()
+	body := m.renderTreePanel()
 	if m.showRecent && len(m.recentVisible) == 0 {
 		body = m.styles.Muted.Render("No files found in recent commits")
 	} else if !m.showRecent && len(m.filteredItems) == 0 {
@@ -677,12 +683,8 @@ func (m *Model) applyCurrentList() {
 
 func (m *Model) applyFiltersToList() {
 	m.filteredItems = ApplyFilters(m.allItems, m.filters)
-	items := make([]list.Item, 0, len(m.filteredItems))
-	for _, change := range m.filteredItems {
-		items = append(items, changeListItem{change: change})
-	}
-	m.changes.SetItems(items)
-	m.lastSelID = ""
+	m.treeRows = buildChangeTreeRows(m.filteredItems, m.leftWidth)
+	m.resetSelection()
 }
 
 func (m *Model) applyRecentFilesToList() {
@@ -701,42 +703,31 @@ func (m *Model) applyRecentFilesToList() {
 		filtered = append(filtered, file)
 	}
 	m.recentVisible = filtered
-
-	items := make([]list.Item, 0, len(filtered))
-	for _, file := range filtered {
-		items = append(items, recentFileListItem{file: file})
-	}
-	m.changes.SetItems(items)
-	m.lastSelID = ""
+	m.treeRows = buildRecentTreeRows(filtered, m.leftWidth)
+	m.resetSelection()
 }
 
 func (m *Model) selectedItem() *model.ChangeItem {
-	sel := m.changes.SelectedItem()
-	if sel == nil {
+	if m.selectedTree < 0 || m.selectedTree >= len(m.treeRows) {
 		return nil
 	}
-
-	v, ok := sel.(changeListItem)
-	if !ok {
+	row := m.treeRows[m.selectedTree]
+	if row.change == nil {
 		return nil
 	}
-
-	copy := v.change
+	copy := *row.change
 	return &copy
 }
 
 func (m *Model) selectedRecentFile() *model.CommitFile {
-	sel := m.changes.SelectedItem()
-	if sel == nil {
+	if m.selectedTree < 0 || m.selectedTree >= len(m.treeRows) {
 		return nil
 	}
-
-	v, ok := sel.(recentFileListItem)
-	if !ok {
+	row := m.treeRows[m.selectedTree]
+	if row.commitFile == nil {
 		return nil
 	}
-
-	copy := v.file
+	copy := *row.commitFile
 	return &copy
 }
 
@@ -1037,4 +1028,248 @@ func renderNumberedLines(lines []string, keep []bool) string {
 	}
 
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m *Model) renderTreePanel() string {
+	if len(m.treeRows) == 0 {
+		return ""
+	}
+	start := m.leftOffset
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(m.treeRows) {
+		start = len(m.treeRows) - 1
+	}
+	end := start + m.leftHeight
+	if end > len(m.treeRows) {
+		end = len(m.treeRows)
+	}
+
+	b := strings.Builder{}
+	for i := start; i < end; i++ {
+		row := m.treeRows[i]
+		line := truncateText(row.text, maxInt(m.leftWidth-2, 4))
+		if i == m.selectedTree {
+			b.WriteString(m.styles.Title.Render("> " + line))
+		} else if !row.selectable {
+			b.WriteString(m.styles.Muted.Render("  " + line))
+		} else {
+			b.WriteString("  " + line)
+		}
+		if i != end-1 {
+			b.WriteByte('\n')
+		}
+	}
+
+	return b.String()
+}
+
+func (m *Model) resetSelection() {
+	m.lastSelID = ""
+	m.leftOffset = 0
+	m.selectedTree = -1
+	for i, row := range m.treeRows {
+		if row.selectable {
+			m.selectedTree = i
+			break
+		}
+	}
+	m.ensureSelectionVisible()
+}
+
+func (m *Model) moveSelection(delta int) {
+	if len(m.treeRows) == 0 || delta == 0 {
+		return
+	}
+	if m.selectedTree < 0 {
+		m.resetSelection()
+		return
+	}
+
+	i := m.selectedTree + delta
+	for i >= 0 && i < len(m.treeRows) {
+		if m.treeRows[i].selectable {
+			m.selectedTree = i
+			m.ensureSelectionVisible()
+			return
+		}
+		i += delta
+	}
+}
+
+func (m *Model) pageSelection(direction int) {
+	step := maxInt(m.leftHeight-1, 1)
+	if direction < 0 {
+		step = -step
+	}
+	m.moveSelection(step)
+}
+
+func (m *Model) ensureSelectionVisible() {
+	if m.selectedTree < 0 || m.leftHeight <= 0 {
+		return
+	}
+	if m.selectedTree < m.leftOffset {
+		m.leftOffset = m.selectedTree
+	}
+	if m.selectedTree >= m.leftOffset+m.leftHeight {
+		m.leftOffset = m.selectedTree - m.leftHeight + 1
+	}
+	if m.leftOffset < 0 {
+		m.leftOffset = 0
+	}
+}
+
+func buildChangeTreeRows(changes []model.ChangeItem, width int) []treeRow {
+	roots := map[string]*treeBuildNode{}
+	rootOrder := []string{}
+	for _, c := range changes {
+		scope := c.ScopeLabel()
+		r, ok := roots[scope]
+		if !ok {
+			r = &treeBuildNode{Name: scope, Folders: map[string]*treeBuildNode{}, ScopeKey: scope, IsRoot: scope == "root"}
+			roots[scope] = r
+			rootOrder = append(rootOrder, scope)
+		}
+		insertChangeNode(r, c)
+	}
+	sort.Strings(rootOrder)
+
+	rows := make([]treeRow, 0, len(changes)+len(rootOrder))
+	for _, scope := range rootOrder {
+		r := roots[scope]
+		header := "/"
+		if scope != "root" {
+			header = scope
+		}
+		rows = append(rows, treeRow{id: "scope|" + scope, text: "▾ " + header, selectable: false})
+		rows = append(rows, flattenChangeNodeRows(r, 1)...)
+	}
+
+	_ = width
+	return rows
+}
+
+func flattenChangeNodeRows(n *treeBuildNode, depth int) []treeRow {
+	rows := []treeRow{}
+	folderNames := make([]string, 0, len(n.Folders))
+	for k := range n.Folders {
+		folderNames = append(folderNames, k)
+	}
+	sort.Strings(folderNames)
+	indent := strings.Repeat("  ", depth)
+	for _, name := range folderNames {
+		child := n.Folders[name]
+		rows = append(rows, treeRow{id: "dir|" + child.Path, text: indent + "▾ " + name, selectable: false})
+		rows = append(rows, flattenChangeNodeRows(child, depth+1)...)
+	}
+
+	sort.SliceStable(n.Files, func(i int, j int) bool {
+		return n.Files[i].Path < n.Files[j].Path
+	})
+	for _, f := range n.Files {
+		copy := f
+		rows = append(rows, treeRow{
+			id:         "file|" + f.ScopeLabel() + "|" + string(f.Type) + "|" + f.Path,
+			text:       indent + statusLetter(f.Type) + " " + baseName(f.Path),
+			selectable: true,
+			change:     &copy,
+		})
+	}
+
+	return rows
+}
+
+func insertChangeNode(root *treeBuildNode, change model.ChangeItem) {
+	parts := pathParts(change.Path)
+	if len(parts) == 0 {
+		root.Files = append(root.Files, change)
+		return
+	}
+
+	cur := root
+	for i := 0; i < len(parts)-1; i++ {
+		name := parts[i]
+		child, ok := cur.Folders[name]
+		if !ok {
+			full := strings.Join(parts[:i+1], "/")
+			child = &treeBuildNode{Name: name, Path: full, Folders: map[string]*treeBuildNode{}, ScopeKey: root.ScopeKey}
+			cur.Folders[name] = child
+		}
+		cur = child
+	}
+	cur.Files = append(cur.Files, change)
+}
+
+func buildRecentTreeRows(files []model.CommitFile, width int) []treeRow {
+	changes := make([]model.ChangeItem, 0, len(files))
+	fileMap := map[string]model.CommitFile{}
+	for _, f := range files {
+		ctype := model.ChangeTypeUnstaged
+		changes = append(changes, model.ChangeItem{Path: f.Path, Type: ctype, SubmodulePath: f.SubmodulePath})
+		key := f.Scope + "|" + f.Path
+		fileMap[key] = f
+	}
+	rows := buildChangeTreeRows(changes, width)
+	for i := range rows {
+		if rows[i].change != nil {
+			key := rows[i].change.ScopeLabel() + "|" + rows[i].change.Path
+			if f, ok := fileMap[key]; ok {
+				copy := f
+				leaf := baseName(f.Path)
+				rows[i].commitFile = &copy
+				rows[i].change = nil
+				rows[i].id = "recent|" + f.Scope + "|" + f.CommitHash + "|" + f.Path
+				rows[i].text = strings.Repeat("  ", treeDepthFromText(rows[i].text)) + shortHash(f.CommitHash) + " " + leaf
+			}
+		}
+	}
+	return rows
+}
+
+func treeDepthFromText(line string) int {
+	depth := 0
+	for strings.HasPrefix(line, "  ") {
+		depth++
+		line = line[2:]
+	}
+	return depth
+}
+
+func statusLetter(t model.ChangeType) string {
+	switch t {
+	case model.ChangeTypeStaged:
+		return "S"
+	case model.ChangeTypeUnstaged:
+		return "M"
+	case model.ChangeTypeUntracked:
+		return "A"
+	default:
+		return "?"
+	}
+}
+
+func baseName(path string) string {
+	parts := pathParts(path)
+	if len(parts) == 0 {
+		return path
+	}
+	return parts[len(parts)-1]
+}
+
+func pathParts(path string) []string {
+	trimmed := strings.Trim(path, "/")
+	if trimmed == "" {
+		return nil
+	}
+	parts := strings.Split(trimmed, "/")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
