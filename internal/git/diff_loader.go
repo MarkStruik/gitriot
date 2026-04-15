@@ -15,8 +15,9 @@ type LineRange struct {
 }
 
 type LineDecoration struct {
-	Added   bool
-	Deleted bool
+	Added        bool
+	Deleted      bool
+	DeletedLines []string
 }
 
 type DiffLoader struct {
@@ -186,6 +187,7 @@ func ParseLineDecorationsFromPatch(patch string) map[int]LineDecoration {
 			}
 			d := decor[target]
 			d.Deleted = true
+			d.DeletedLines = append(d.DeletedLines, strings.TrimPrefix(line, "-"))
 			decor[target] = d
 			oldLine++
 		case ' ':

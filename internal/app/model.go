@@ -1218,11 +1218,18 @@ func renderNumberedLines(lines []string, keep []bool, decor map[int]git.LineDeco
 			b.WriteString("...\n")
 			skipped = false
 		}
+		if d, ok := decor[i+1]; ok && len(d.DeletedLines) > 0 {
+			for _, deletedLine := range d.DeletedLines {
+				deletedRow := fmt.Sprintf("\x1b[31m-\x1b[0m %6s │ %s", "", deletedLine)
+				deletedRow = "\x1b[48;5;52m" + deletedRow + "\x1b[0m"
+				b.WriteString(deletedRow + "\n")
+			}
+		}
 		marker := " "
 		if d, ok := decor[i+1]; ok {
 			switch {
 			case d.Added && d.Deleted:
-				marker = "\x1b[33m~\x1b[0m"
+				marker = "\x1b[32m+\x1b[0m"
 			case d.Added:
 				marker = "\x1b[32m+\x1b[0m"
 			case d.Deleted:
@@ -1233,7 +1240,7 @@ func renderNumberedLines(lines []string, keep []bool, decor map[int]git.LineDeco
 		if d, ok := decor[i+1]; ok {
 			switch {
 			case d.Added && d.Deleted:
-				rowText = "\x1b[48;5;58m" + rowText + "\x1b[0m"
+				rowText = "\x1b[48;5;22m" + rowText + "\x1b[0m"
 			case d.Added:
 				rowText = "\x1b[48;5;22m" + rowText + "\x1b[0m"
 			case d.Deleted:
