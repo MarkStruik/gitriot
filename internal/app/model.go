@@ -465,10 +465,12 @@ func (m Model) View() string {
 		return "Initializing GitRiot..."
 	}
 
+	leftWidth, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
 	top := m.renderTopBar()
-	left := m.renderChangesPane()
-	right := m.renderDiffPane()
-	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
+	left := m.renderChangesPane(leftWidth, paneHeight)
+	right := m.renderDiffPane(rightWidth, paneHeight)
+	sep := m.styles.Muted.Render("|")
+	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right)
 	bottom := m.renderBottomBar()
 
 	base := lipgloss.JoinVertical(lipgloss.Left, top, panes, bottom)
@@ -477,7 +479,7 @@ func (m Model) View() string {
 		base = lipgloss.JoinVertical(lipgloss.Left, base, search)
 	}
 
-	return m.styles.Frame.Width(m.width).Render(base)
+	return m.styles.Frame.Width(m.width).Height(m.height).MaxWidth(m.width).MaxHeight(m.height).Render(base)
 }
 
 func (m *Model) resize() {
@@ -521,19 +523,18 @@ func (m *Model) renderTopBar() string {
 	return m.styles.Status.Width(m.width).Render(status)
 }
 
-func (m *Model) renderChangesPane() string {
+func (m *Model) renderChangesPane(width int, height int) string {
 	titleText := "Changes"
 	if m.showRecent {
 		titleText = "Commit Files"
 	}
-	title := m.styles.Title.Render(titleText)
+	titlePrefix := "  "
+	if m.focus == focusChanges {
+		titlePrefix = "* "
+	}
+	title := m.styles.Title.Render(titlePrefix + titleText)
 	if m.loading {
 		title = title + " " + m.styles.Muted.Render("(loading)")
-	}
-
-	pane := m.styles.Pane
-	if m.focus == focusChanges {
-		pane = m.styles.PaneActive
 	}
 
 	body := m.renderTreePanel()
@@ -543,11 +544,11 @@ func (m *Model) renderChangesPane() string {
 		body = m.styles.Muted.Render("No changes match filters")
 	}
 
-	leftWidth, _, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
-	return pane.Width(leftWidth).Height(maxInt(paneHeight-2, 3)).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
+	panel := lipgloss.JoinVertical(lipgloss.Left, title, body)
+	return lipgloss.NewStyle().Width(width).Height(maxInt(height, 3)).Render(panel)
 }
 
-func (m *Model) renderDiffPane() string {
+func (m *Model) renderDiffPane(width int, height int) string {
 	titleText := "Diff"
 	if m.showRecent {
 		titleText = "Commit Details"
@@ -555,16 +556,15 @@ func (m *Model) renderDiffPane() string {
 	if m.activeRef != "" {
 		titleText = titleText + " - " + truncateText(m.activeRef, maxInt(m.width/2, 24))
 	}
-	title := m.styles.Title.Render(titleText)
-	pane := m.styles.Pane
+	titlePrefix := "  "
 	if m.focus == focusDiff {
-		pane = m.styles.PaneActive
+		titlePrefix = "* "
 	}
+	title := m.styles.Title.Render(titlePrefix + titleText)
 
 	body := m.diff.View()
-
-	_, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
-	return pane.Width(rightWidth).Height(maxInt(paneHeight-2, 3)).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
+	panel := lipgloss.JoinVertical(lipgloss.Left, title, body)
+	return lipgloss.NewStyle().Width(width).Height(maxInt(height, 3)).Render(panel)
 }
 
 func (m *Model) renderBottomBar() string {
