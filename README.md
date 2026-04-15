@@ -34,6 +34,11 @@ Faster cached build with Docker volumes:
 ./scripts/build.ps1
 ```
 
+Faster cached tests with Docker volumes:
+```powershell
+./scripts/test.ps1
+```
+
 This uses persistent Docker volumes for:
 - `/go/pkg/mod` (module download cache)
 - `/root/.cache/go-build` (compiled build cache)
@@ -69,6 +74,7 @@ colors:
 - `left` / `h` (tree pane): collapse folder or move up
 - `right` / `l` (tree pane): expand folder
 - `space` (tree pane): toggle folder collapse
+- `x` / `X` (tree pane): collapse all / expand all
 - `enter`: reload diff for current selection
 - `h` (diff pane): toggle full-file vs hunks-only view (hunks show +/- 5 context lines)
 - `s`: toggle staged changes

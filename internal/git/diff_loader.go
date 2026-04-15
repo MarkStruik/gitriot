@@ -14,6 +14,11 @@ type LineRange struct {
 	End   int
 }
 
+type LineDecoration struct {
+	Added   bool
+	Deleted bool
+}
+
 type DiffLoader struct {
 	runner Runner
 }
@@ -144,6 +149,61 @@ func ParseChangedLineRangesFromPatch(patch string) []LineRange {
 	return ranges
 }
 
+func ParseLineDecorationsFromPatch(patch string) map[int]LineDecoration {
+	lines := strings.Split(patch, "\n")
+	decor := make(map[int]LineDecoration)
+	oldLine := 0
+	newLine := 0
+	inHunk := false
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "@@ ") {
+			oldStart, _, newStart, _, ok := parseUnifiedHeader(line)
+			if !ok {
+				inHunk = false
+				continue
+			}
+			oldLine = oldStart
+			newLine = newStart
+			inHunk = true
+			continue
+		}
+
+		if !inHunk || line == "" {
+			continue
+		}
+
+		switch line[0] {
+		case '+':
+			d := decor[newLine]
+			d.Added = true
+			decor[newLine] = d
+			newLine++
+		case '-':
+			target := newLine
+			if target <= 0 {
+				target = 1
+			}
+			d := decor[target]
+			d.Deleted = true
+			decor[target] = d
+			oldLine++
+		case ' ':
+			oldLine++
+			newLine++
+		case '\\':
+			continue
+		default:
+			if oldLine > 0 || newLine > 0 {
+				oldLine++
+				newLine++
+			}
+		}
+	}
+
+	return decor
+}
+
 func parseHunkRange(part string) (start int, count int) {
 	count = 1
 	pieces := strings.Split(part, ",")
@@ -162,4 +222,23 @@ func parseHunkRange(part string) (start int, count int) {
 	}
 
 	return start, count
+}
+
+func parseUnifiedHeader(line string) (oldStart int, oldCount int, newStart int, newCount int, ok bool) {
+	if !strings.HasPrefix(line, "@@ ") {
+		return 0, 0, 0, 0, false
+	}
+	parts := strings.Split(line, " ")
+	if len(parts) < 4 {
+		return 0, 0, 0, 0, false
+	}
+	if !strings.HasPrefix(parts[1], "-") || !strings.HasPrefix(parts[2], "+") {
+		return 0, 0, 0, 0, false
+	}
+	oldStart, oldCount = parseHunkRange(strings.TrimPrefix(parts[1], "-"))
+	newStart, newCount = parseHunkRange(strings.TrimPrefix(parts[2], "+"))
+	if oldStart <= 0 || newStart <= 0 {
+		return 0, 0, 0, 0, false
+	}
+	return oldStart, oldCount, newStart, newCount, true
 }

@@ -150,6 +150,8 @@ type keyMap struct {
 	CollapseNode    key.Binding
 	ExpandNode      key.Binding
 	ToggleNode      key.Binding
+	CollapseAll     key.Binding
+	ExpandAll       key.Binding
 	ToggleHunksOnly key.Binding
 	Search          key.Binding
 	ToggleRecent    key.Binding
@@ -161,7 +163,7 @@ type keyMap struct {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.FocusSwitch, k.ToggleRecent, k.CollapseNode, k.ExpandNode, k.ToggleNode, k.Quit}
+	return []key.Binding{k.FocusSwitch, k.ToggleRecent, k.CollapseNode, k.ExpandNode, k.CollapseAll, k.ExpandAll}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
@@ -184,6 +186,8 @@ var keys = keyMap{
 	CollapseNode:    key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("←/h", "collapse")),
 	ExpandNode:      key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "expand")),
 	ToggleNode:      key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "toggle")),
+	CollapseAll:     key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "collapse all")),
+	ExpandAll:       key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "expand all")),
 	ToggleHunksOnly: key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "toggle hunks-only")),
 	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "toggle commits")),
 	Search:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
@@ -430,8 +434,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+		case key.Matches(msg, keys.CollapseAll):
+			if m.focus == focusChanges {
+				if m.collapseAllTreeNodes() {
+					m.applyCurrentListWithPreserve("")
+					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+						return m, cmd
+					}
+				}
+				return m, nil
+			}
+		case key.Matches(msg, keys.ExpandAll):
+			if m.focus == focusChanges {
+				if m.expandAllTreeNodes() {
+					m.applyCurrentListWithPreserve(m.currentSelectionID())
+					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+						return m, cmd
+					}
+				}
+				return m, nil
+			}
 		case key.Matches(msg, keys.ToggleHunksOnly):
 			if m.focus != focusDiff {
+				return m, nil
+			}
+			if !m.currentSelectionIsFile() {
+				m.message = "Hunks mode applies to file selections only"
 				return m, nil
 			}
 			m.showHunksOnly = !m.showHunksOnly
@@ -615,6 +643,13 @@ func (m *Model) renderDiffPane(width int, height int) string {
 	if m.activeRef != "" {
 		titleText = titleText + " - " + truncateText(m.activeRef, maxInt(m.width/2, 24))
 	}
+	if m.currentSelectionIsFile() {
+		if m.showHunksOnly {
+			titleText += " [Hunks+5]"
+		} else {
+			titleText += " [Full]"
+		}
+	}
 	titlePrefix := "  "
 	if m.focus == focusDiff {
 		titlePrefix = "* "
@@ -644,9 +679,19 @@ func (m *Model) renderBottomBar() string {
 		diffStyle = m.styles.Title
 	}
 
-	treeSeg := treeStyle.Render("󰙅 TREE  ←/h collapse  →/l expand  ␠ toggle")
+	treeSeg := treeStyle.Render("󰙅 TREE  ←/h collapse  →/l expand  ␠ toggle  x/X all")
 	diffSeg := diffStyle.Render("󰈙 DIFF  h hunks/full")
 	globalSeg := m.styles.Muted.Render("󰌌 GLOBAL  tab pane  c commits  / search  r refresh  q quit")
+	if m.width < 120 {
+		treeSeg = treeStyle.Render("󰙅 ←/h →/l ␠ x/X")
+		diffSeg = diffStyle.Render("󰈙 h")
+		globalSeg = m.styles.Muted.Render("tab c / r q")
+	}
+	if m.width < 92 {
+		treeSeg = treeStyle.Render("←/h →/l ␠")
+		diffSeg = diffStyle.Render("h")
+		globalSeg = m.styles.Muted.Render("tab c / q")
+	}
 	helpLine := treeSeg + m.styles.Muted.Render("   •   ") + diffSeg + m.styles.Muted.Render("   •   ") + globalSeg
 	helpLine = truncateText(helpLine, maxInt(m.width-2, 10))
 	return lipgloss.JoinVertical(lipgloss.Left, line, helpLine)
@@ -724,7 +769,9 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 			return diffLoadedMsg{requestID: requestID, view: fallback, empty: result.Empty}
 		}
 
-		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(req.Path, full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
+		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
+		decor := git.ParseLineDecorationsFromPatch(result.Patch)
+		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(req.Path, full, ranges, decor, showHunksOnly, 5)
 		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
 	}
 }
@@ -960,7 +1007,9 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 			return diffLoadedMsg{requestID: requestID, view: fallback, empty: result.Empty}
 		}
 
-		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(file.Path, full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
+		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
+		decor := git.ParseLineDecorationsFromPatch(result.Patch)
+		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(file.Path, full, ranges, decor, showHunksOnly, 5)
 		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
 	}
 }
@@ -974,6 +1023,14 @@ func (m *Model) autoLoadSelectedDiff() tea.Cmd {
 		return nil
 	}
 	m.lastSelID = selectionID
+	if !m.currentSelectionIsFile() {
+		if row := m.currentTreeRow(); row != nil {
+			m.activeRef = treeLabelOnly(row.text)
+			m.diff.SetContent(m.renderTreeSelectionSummary(*row))
+			m.message = "Folder summary"
+		}
+		return nil
+	}
 
 	if m.showRecent {
 		file := m.selectedRecentFile()
@@ -995,6 +1052,38 @@ func (m *Model) currentSelectionID() string {
 		return ""
 	}
 	return m.treeRows[m.selectedTree].id
+}
+
+func (m *Model) currentTreeRow() *treeRow {
+	if m.selectedTree < 0 || m.selectedTree >= len(m.treeRows) {
+		return nil
+	}
+	row := m.treeRows[m.selectedTree]
+	return &row
+}
+
+func (m *Model) currentSelectionIsFile() bool {
+	row := m.currentTreeRow()
+	if row == nil {
+		return false
+	}
+	return row.kind == treeKindFile
+}
+
+func (m *Model) renderTreeSelectionSummary(row treeRow) string {
+	if row.kind == treeKindFile {
+		return m.styles.Muted.Render("File selected")
+	}
+
+	if m.showRecent {
+		scope, prefix := parseTreeNodeScopePrefix(row)
+		files := filterRecentByScopePrefix(m.recentVisible, scope, prefix)
+		return renderRecentSummaryBlock(row.text, files)
+	}
+
+	scope, prefix := parseTreeNodeScopePrefix(row)
+	items := filterChangesByScopePrefix(m.filteredItems, scope, prefix)
+	return renderChangeSummaryBlock(row.text, items)
 }
 
 func shortHash(hash string) string {
@@ -1080,11 +1169,11 @@ func truncateText(input string, maxLen int) string {
 	return string(r[:maxLen-1]) + "…"
 }
 
-func renderFileWithHunks(path string, fullContent string, changed []git.LineRange, hunksOnly bool, contextLines int) string {
-	highlighted := ui.HighlightForPath(path, fullContent)
-	lines := strings.Split(highlighted, "\n")
+func renderFileWithHunks(path string, fullContent string, changed []git.LineRange, decor map[int]git.LineDecoration, hunksOnly bool, contextLines int) string {
+	_ = path
+	lines := strings.Split(fullContent, "\n")
 	if !hunksOnly || len(changed) == 0 {
-		return renderNumberedLines(lines, nil)
+		return renderNumberedLines(lines, nil, decor)
 	}
 
 	keep := make([]bool, len(lines))
@@ -1102,10 +1191,10 @@ func renderFileWithHunks(path string, fullContent string, changed []git.LineRang
 		}
 	}
 
-	return renderNumberedLines(lines, keep)
+	return renderNumberedLines(lines, keep, decor)
 }
 
-func renderNumberedLines(lines []string, keep []bool) string {
+func renderNumberedLines(lines []string, keep []bool, decor map[int]git.LineDecoration) string {
 	b := strings.Builder{}
 	skipped := false
 	for i, line := range lines {
@@ -1117,7 +1206,29 @@ func renderNumberedLines(lines []string, keep []bool) string {
 			b.WriteString("...\n")
 			skipped = false
 		}
-		b.WriteString(fmt.Sprintf("%6d | %s\n", i+1, line))
+		marker := " "
+		if d, ok := decor[i+1]; ok {
+			switch {
+			case d.Added && d.Deleted:
+				marker = "\x1b[33m~\x1b[0m"
+			case d.Added:
+				marker = "\x1b[32m+\x1b[0m"
+			case d.Deleted:
+				marker = "\x1b[31m-\x1b[0m"
+			}
+		}
+		rowText := fmt.Sprintf("%s %6d │ %s", marker, i+1, line)
+		if d, ok := decor[i+1]; ok {
+			switch {
+			case d.Added && d.Deleted:
+				rowText = "\x1b[48;5;58m" + rowText + "\x1b[0m"
+			case d.Added:
+				rowText = "\x1b[48;5;22m" + rowText + "\x1b[0m"
+			case d.Deleted:
+				rowText = "\x1b[48;5;52m" + rowText + "\x1b[0m"
+			}
+		}
+		b.WriteString(rowText + "\n")
 	}
 
 	if b.Len() == 0 {
@@ -1328,6 +1439,30 @@ func (m *Model) parentNodeID(nodeID string) string {
 	return ""
 }
 
+func (m *Model) collapseAllTreeNodes() bool {
+	if len(m.treeRows) == 0 {
+		return false
+	}
+	changed := false
+	for _, row := range m.treeRows {
+		if row.kind == treeKindScope || row.kind == treeKindDir {
+			if !m.treeCollapsed[row.nodeID] {
+				m.treeCollapsed[row.nodeID] = true
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func (m *Model) expandAllTreeNodes() bool {
+	if len(m.treeCollapsed) == 0 {
+		return false
+	}
+	m.treeCollapsed = map[string]bool{}
+	return true
+}
+
 func buildChangeTreeRows(changes []model.ChangeItem, scopeBranches map[string]string, collapsed map[string]bool) []treeRow {
 	roots := map[string]*treeBuildNode{}
 	rootOrder := []string{}
@@ -1511,6 +1646,132 @@ func pathParts(path string) []string {
 	return out
 }
 
+func parseTreeNodeScopePrefix(row treeRow) (scope string, prefix string) {
+	if strings.HasPrefix(row.nodeID, "scope|") {
+		parts := strings.SplitN(row.nodeID, "|", 2)
+		if len(parts) == 2 {
+			return parts[1], ""
+		}
+		return "root", ""
+	}
+	if strings.HasPrefix(row.nodeID, "dir|") {
+		parts := strings.SplitN(row.nodeID, "|", 3)
+		if len(parts) == 3 {
+			return parts[1], parts[2]
+		}
+	}
+	if row.change != nil {
+		return row.change.ScopeLabel(), row.change.Path
+	}
+	if row.commitFile != nil {
+		return row.commitFile.Scope, row.commitFile.Path
+	}
+	return "root", ""
+}
+
+func filterChangesByScopePrefix(items []model.ChangeItem, scope string, prefix string) []model.ChangeItem {
+	out := make([]model.ChangeItem, 0)
+	prefix = strings.Trim(prefix, "/")
+	for _, item := range items {
+		if item.ScopeLabel() != scope {
+			continue
+		}
+		if prefix != "" && !strings.HasPrefix(item.Path, prefix+"/") && item.Path != prefix {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func filterRecentByScopePrefix(files []model.CommitFile, scope string, prefix string) []model.CommitFile {
+	out := make([]model.CommitFile, 0)
+	prefix = strings.Trim(prefix, "/")
+	for _, file := range files {
+		if file.Scope != scope {
+			continue
+		}
+		if prefix != "" && !strings.HasPrefix(file.Path, prefix+"/") && file.Path != prefix {
+			continue
+		}
+		out = append(out, file)
+	}
+	return out
+}
+
+func treeLabelOnly(text string) string {
+	trimmed := strings.TrimSpace(text)
+	trimmed = strings.TrimPrefix(trimmed, "▾ ")
+	trimmed = strings.TrimPrefix(trimmed, "▸ ")
+	return strings.TrimSpace(trimmed)
+}
+
+func renderChangeSummaryBlock(label string, items []model.ChangeItem) string {
+	b := strings.Builder{}
+	b.WriteString("Folder: ")
+	b.WriteString(treeLabelOnly(label))
+	b.WriteString("\n\n")
+	if len(items) == 0 {
+		b.WriteString("No changed files in this folder")
+		return b.String()
+	}
+
+	counts := map[model.ChangeType]int{}
+	paths := make([]string, 0, len(items))
+	for _, item := range items {
+		counts[item.Type]++
+		paths = append(paths, fmt.Sprintf("%s  %s", statusLetter(item.Type), item.Path))
+	}
+	sort.Strings(paths)
+	b.WriteString(fmt.Sprintf("Files: %d  (S:%d M:%d A:%d)\n\n", len(items), counts[model.ChangeTypeStaged], counts[model.ChangeTypeUnstaged], counts[model.ChangeTypeUntracked]))
+	maxList := 80
+	if len(paths) < maxList {
+		maxList = len(paths)
+	}
+	for i := 0; i < maxList; i++ {
+		b.WriteString(paths[i])
+		if i < maxList-1 {
+			b.WriteByte('\n')
+		}
+	}
+	if len(paths) > maxList {
+		b.WriteString(fmt.Sprintf("\n... and %d more", len(paths)-maxList))
+	}
+	return b.String()
+}
+
+func renderRecentSummaryBlock(label string, files []model.CommitFile) string {
+	b := strings.Builder{}
+	b.WriteString("Folder: ")
+	b.WriteString(treeLabelOnly(label))
+	b.WriteString("\n\n")
+	if len(files) == 0 {
+		b.WriteString("No recent commit files in this folder")
+		return b.String()
+	}
+	b.WriteString(fmt.Sprintf("Files: %d\n\n", len(files)))
+
+	list := make([]string, 0, len(files))
+	for _, f := range files {
+		list = append(list, fmt.Sprintf("%s  %s", shortHash(f.CommitHash), f.Path))
+	}
+	sort.Strings(list)
+	maxList := 80
+	if len(list) < maxList {
+		maxList = len(list)
+	}
+	for i := 0; i < maxList; i++ {
+		b.WriteString(list[i])
+		if i < maxList-1 {
+			b.WriteByte('\n')
+		}
+	}
+	if len(list) > maxList {
+		b.WriteString(fmt.Sprintf("\n... and %d more", len(list)-maxList))
+	}
+	return b.String()
+}
+
 func collectSubmodulePathsFromChanges(items []model.ChangeItem) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0)
@@ -1561,6 +1822,6 @@ func renderVerticalSep(height int) string {
 	if height <= 0 {
 		return ""
 	}
-	line := strings.Repeat("|\n", height)
+	line := strings.Repeat("│\n", height)
 	return strings.TrimRight(line, "\n")
 }
