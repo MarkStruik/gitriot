@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"io"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -40,10 +41,34 @@ func (d changeListDelegate) Render(w io.Writer, m list.Model, index int, item li
 		line = titled.Title()
 	}
 
+	maxWidth := m.Width() - 2
+	if maxWidth < 4 {
+		maxWidth = 4
+	}
+	line = truncateRunes(line, maxWidth)
+
 	if index == m.Index() {
-		_, _ = fmt.Fprint(w, d.selectedStyle.Render("> "+line))
+		row := fmt.Sprintf("> %-*s", maxWidth, line)
+		_, _ = fmt.Fprint(w, d.selectedStyle.Render(row))
 		return
 	}
 
-	_, _ = fmt.Fprint(w, d.normalStyle.Render("  "+line))
+	row := fmt.Sprintf("  %-*s", maxWidth, line)
+	_, _ = fmt.Fprint(w, d.normalStyle.Render(row))
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+
+	r := []rune(s)
+	if max < 2 {
+		return string(r[:max])
+	}
+
+	return string(r[:max-1]) + "…"
 }

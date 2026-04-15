@@ -396,6 +396,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.message = "Showing full file"
 			}
+			m.lastSelID = ""
 			if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 				return m, cmd
 			}
@@ -482,9 +483,10 @@ func (m *Model) resize() {
 
 	leftWidth, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
 
-	m.changes.SetSize(leftWidth-4, paneHeight-2)
+	contentHeight := maxInt(paneHeight-4, 1)
+	m.changes.SetSize(leftWidth-4, contentHeight)
 	m.diff.Width = rightWidth - 4
-	m.diff.Height = paneHeight - 2
+	m.diff.Height = contentHeight
 }
 
 func (m *Model) rotateFocus() {
@@ -536,7 +538,7 @@ func (m *Model) renderChangesPane() string {
 	}
 
 	leftWidth, _, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
-	return pane.Width(leftWidth).Height(paneHeight).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
+	return pane.Width(leftWidth).Height(maxInt(paneHeight-2, 3)).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
 }
 
 func (m *Model) renderDiffPane() string {
@@ -556,7 +558,7 @@ func (m *Model) renderDiffPane() string {
 	body := m.diff.View()
 
 	_, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
-	return pane.Width(rightWidth).Height(paneHeight).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
+	return pane.Width(rightWidth).Height(maxInt(paneHeight-2, 3)).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
 }
 
 func (m *Model) renderBottomBar() string {
@@ -624,10 +626,11 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 
 		full, fullErr := m.diffs.LoadWorkingFile(req)
 		if fullErr != nil {
-			return diffLoadedMsg{requestID: requestID, err: fullErr}
+			fallback := "Path: " + activeRef + "\n\n" + m.renderDiff(result)
+			return diffLoadedMsg{requestID: requestID, view: fallback, empty: result.Empty}
 		}
 
-		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
+		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(req.Path, full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
 		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
 	}
 }
@@ -856,10 +859,11 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 
 		full, fullErr := m.diffs.LoadCommitFile(ctx, req)
 		if fullErr != nil {
-			return diffLoadedMsg{requestID: requestID, err: fullErr}
+			fallback := "Path: " + activeRef + "\n\n" + m.renderDiff(result)
+			return diffLoadedMsg{requestID: requestID, view: fallback, empty: result.Empty}
 		}
 
-		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
+		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(file.Path, full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
 		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
 	}
 }
@@ -988,8 +992,9 @@ func truncateText(input string, maxLen int) string {
 	return string(r[:maxLen-1]) + "…"
 }
 
-func renderFileWithHunks(fullContent string, changed []git.LineRange, hunksOnly bool, contextLines int) string {
-	lines := strings.Split(fullContent, "\n")
+func renderFileWithHunks(path string, fullContent string, changed []git.LineRange, hunksOnly bool, contextLines int) string {
+	highlighted := ui.HighlightForPath(path, fullContent)
+	lines := strings.Split(highlighted, "\n")
 	if !hunksOnly || len(changed) == 0 {
 		return renderNumberedLines(lines, nil)
 	}
