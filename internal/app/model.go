@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"gitriot/internal/git"
 	"gitriot/internal/model"
 	"gitriot/internal/theme"
@@ -79,6 +80,8 @@ type Model struct {
 	lastSelID       string
 	activeRef       string
 	lastFingerprint string
+	diffRawLines    []string
+	diffXOffset     int
 }
 
 type treeRow struct {
@@ -119,7 +122,7 @@ type indexLoadedMsg struct {
 
 type diffLoadedMsg struct {
 	requestID int
-	view      string
+	lines     []string
 	isBinary  bool
 	empty     bool
 	err       error
@@ -183,12 +186,12 @@ var keys = keyMap{
 	FilterUnstaged:  key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "toggle unstaged")),
 	FilterUntracked: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "toggle untracked")),
 	FilterSubmodule: key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle submodule")),
-	CollapseNode:    key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("←/h", "collapse")),
+	CollapseNode:    key.NewBinding(key.WithKeys("left"), key.WithHelp("←", "collapse")),
 	ExpandNode:      key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "expand")),
 	ToggleNode:      key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "toggle")),
 	CollapseAll:     key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "collapse all")),
 	ExpandAll:       key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "expand all")),
-	ToggleHunksOnly: key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "toggle hunks-only")),
+	ToggleHunksOnly: key.NewBinding(key.WithKeys("h", "H"), key.WithHelp("h", "toggle hunks/full")),
 	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "toggle commits")),
 	Search:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
 	CloseSearch:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "close search")),
@@ -304,7 +307,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.applyCurrentList()
 		if m.showRecent {
-			m.diff.SetContent(m.renderRecentSummary())
+			m.setDiffText(m.renderRecentSummary())
 			m.activeRef = "recent snapshot"
 			if m.recentLoaded {
 				m.message = fmt.Sprintf("Loaded %d files from recent commits", len(m.recentVisible))
@@ -340,7 +343,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.warn = append(m.warn, msg.result.Warnings...)
 		m.applyCurrentList()
-		m.diff.SetContent(m.renderRecentSummary())
+		m.setDiffText(m.renderRecentSummary())
 		m.message = fmt.Sprintf("Loaded %d files from recent commits", len(m.recentVisible))
 		if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 			return m, cmd
@@ -352,12 +355,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if msg.err != nil {
-			m.diff.SetContent("Unable to load diff:\n" + msg.err.Error())
+			m.setDiffText("Unable to load diff:\n" + msg.err.Error())
 			m.message = "Diff loading failed"
 			return m, nil
 		}
 
-		m.diff.SetContent(msg.view)
+		m.diffRawLines = msg.lines
+		m.diffXOffset = 0
+		m.refreshDiffViewport()
 		if msg.isBinary {
 			m.message = "Binary diff loaded"
 		} else if msg.empty {
@@ -385,7 +390,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showRecent = !m.showRecent
 			if m.showRecent {
 				m.applyCurrentList()
-				m.diff.SetContent(m.renderRecentSummary())
+				m.setDiffText(m.renderRecentSummary())
 				m.activeRef = "recent snapshot"
 				if !m.recentLoaded {
 					m.message = "Loading recent commits..."
@@ -414,6 +419,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.focus == focusDiff {
+				m.shiftDiffX(-8)
+				return m, nil
+			}
 		case key.Matches(msg, keys.ExpandNode):
 			if m.focus == focusChanges {
 				if ok, preserve := m.expandTreeAtSelection(); ok {
@@ -422,6 +431,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, cmd
 					}
 				}
+				return m, nil
+			}
+			if m.focus == focusDiff {
+				m.shiftDiffX(8)
 				return m, nil
 			}
 		case key.Matches(msg, keys.ToggleNode):
@@ -455,9 +468,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case key.Matches(msg, keys.ToggleHunksOnly):
-			if m.focus != focusDiff {
-				return m, nil
-			}
 			if !m.currentSelectionIsFile() {
 				m.message = "Hunks mode applies to file selections only"
 				return m, nil
@@ -591,6 +601,7 @@ func (m *Model) resize() {
 	m.diff.Width = rightWidth - 4
 	m.diff.Height = contentHeight
 	m.ensureSelectionVisible()
+	m.refreshDiffViewport()
 }
 
 func (m *Model) rotateFocus() {
@@ -748,7 +759,7 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 		Mode:          diffModeForChange(item),
 	}
 
-	m.diff.SetContent("Loading diff...")
+	m.setDiffText("Loading diff...")
 	showHunksOnly := m.showHunksOnly
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
@@ -760,19 +771,19 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 		}
 
 		if result.IsBinary {
-			return diffLoadedMsg{requestID: requestID, view: "Binary file diff", isBinary: true, empty: result.Empty}
+			return diffLoadedMsg{requestID: requestID, lines: []string{"Binary file diff"}, isBinary: true, empty: result.Empty}
 		}
 
 		full, fullErr := m.diffs.LoadWorkingFile(req)
 		if fullErr != nil {
 			fallback := "Path: " + activeRef + "\n\n" + m.renderDiff(result)
-			return diffLoadedMsg{requestID: requestID, view: fallback, empty: result.Empty}
+			return diffLoadedMsg{requestID: requestID, lines: strings.Split(fallback, "\n"), empty: result.Empty}
 		}
 
 		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 		decor := git.ParseLineDecorationsFromPatch(result.Patch)
 		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(req.Path, full, ranges, decor, showHunksOnly, 5)
-		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
+		return diffLoadedMsg{requestID: requestID, lines: strings.Split(view, "\n"), empty: result.Empty}
 	}
 }
 
@@ -987,7 +998,7 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 		Path:          file.Path,
 	}
 
-	m.diff.SetContent("Loading commit diff...")
+	m.setDiffText("Loading commit diff...")
 	showHunksOnly := m.showHunksOnly
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
@@ -998,19 +1009,19 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 			return diffLoadedMsg{requestID: requestID, err: err}
 		}
 		if result.IsBinary {
-			return diffLoadedMsg{requestID: requestID, view: "Binary file diff", isBinary: true, empty: result.Empty}
+			return diffLoadedMsg{requestID: requestID, lines: []string{"Binary file diff"}, isBinary: true, empty: result.Empty}
 		}
 
 		full, fullErr := m.diffs.LoadCommitFile(ctx, req)
 		if fullErr != nil {
 			fallback := "Path: " + activeRef + "\n\n" + m.renderDiff(result)
-			return diffLoadedMsg{requestID: requestID, view: fallback, empty: result.Empty}
+			return diffLoadedMsg{requestID: requestID, lines: strings.Split(fallback, "\n"), empty: result.Empty}
 		}
 
 		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 		decor := git.ParseLineDecorationsFromPatch(result.Patch)
 		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(file.Path, full, ranges, decor, showHunksOnly, 5)
-		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
+		return diffLoadedMsg{requestID: requestID, lines: strings.Split(view, "\n"), empty: result.Empty}
 	}
 }
 
@@ -1026,7 +1037,7 @@ func (m *Model) autoLoadSelectedDiff() tea.Cmd {
 	if !m.currentSelectionIsFile() {
 		if row := m.currentTreeRow(); row != nil {
 			m.activeRef = treeLabelOnly(row.text)
-			m.diff.SetContent(m.renderTreeSelectionSummary(*row))
+			m.setDiffText(m.renderTreeSelectionSummary(*row))
 			m.message = "Folder summary"
 		}
 		return nil
@@ -1170,8 +1181,8 @@ func truncateText(input string, maxLen int) string {
 }
 
 func renderFileWithHunks(path string, fullContent string, changed []git.LineRange, decor map[int]git.LineDecoration, hunksOnly bool, contextLines int) string {
-	_ = path
-	lines := strings.Split(fullContent, "\n")
+	highlighted := ui.HighlightForPath(path, fullContent)
+	lines := strings.Split(highlighted, "\n")
 	if !hunksOnly || len(changed) == 0 {
 		return renderNumberedLines(lines, nil, decor)
 	}
@@ -1236,6 +1247,60 @@ func renderNumberedLines(lines []string, keep []bool, decor map[int]git.LineDeco
 	}
 
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m *Model) setDiffText(text string) {
+	m.diffRawLines = strings.Split(text, "\n")
+	m.diffXOffset = 0
+	m.refreshDiffViewport()
+}
+
+func (m *Model) refreshDiffViewport() {
+	if m.diff.Width <= 0 {
+		m.diff.SetContent(strings.Join(m.diffRawLines, "\n"))
+		return
+	}
+	if len(m.diffRawLines) == 0 {
+		m.diff.SetContent("")
+		return
+	}
+	width := m.diff.Width
+	b := strings.Builder{}
+	for i, line := range m.diffRawLines {
+		visible := ansi.Cut(line, m.diffXOffset, m.diffXOffset+width)
+		b.WriteString(visible)
+		if i < len(m.diffRawLines)-1 {
+			b.WriteByte('\n')
+		}
+	}
+	m.diff.SetContent(b.String())
+}
+
+func (m *Model) shiftDiffX(delta int) {
+	if delta == 0 {
+		return
+	}
+	maxWidth := 0
+	for _, line := range m.diffRawLines {
+		w := ansi.StringWidth(line)
+		if w > maxWidth {
+			maxWidth = w
+		}
+	}
+	if maxWidth <= m.diff.Width {
+		m.diffXOffset = 0
+		m.refreshDiffViewport()
+		return
+	}
+	m.diffXOffset += delta
+	if m.diffXOffset < 0 {
+		m.diffXOffset = 0
+	}
+	maxOffset := maxWidth - m.diff.Width
+	if m.diffXOffset > maxOffset {
+		m.diffXOffset = maxOffset
+	}
+	m.refreshDiffViewport()
 }
 
 func (m *Model) renderTreePanel() string {
