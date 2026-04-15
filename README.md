@@ -19,6 +19,11 @@ Run with recent commit window enabled:
 docker run --rm -it -v "${PWD}:/src" -w /src golang:1.24 sh -c "go run ./cmd/gitriot --repo . --recent-window 2h"
 ```
 
+Run in embedded terminals (disable alternate screen):
+```bash
+docker run --rm -it -v "${PWD}:/src" -w /src golang:1.24 sh -c "go run ./cmd/gitriot --repo . --no-alt-screen"
+```
+
 ## Build Windows executable
 ```bash
 docker run --rm -v "${PWD}:/src" -w /src golang:1.24 sh -c "mkdir -p publish && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o publish/gitriot.exe ./cmd/gitriot"
@@ -66,3 +71,4 @@ colors:
 - GitRiot currently shells out to native Git CLI commands.
 - Submodule failures are reported as warnings; the app remains interactive.
 - Recent commit view is anchored to the root repository last commit and includes submodules whose last commit time is within the provided window.
+- Embedded terminals (for example Rider/JetBrains terminal) may render better with `--no-alt-screen`.

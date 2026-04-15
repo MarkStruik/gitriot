@@ -142,12 +142,10 @@ var keys = keyMap{
 
 func NewModel(opt Option) Model {
 	runner := git.NewCLIRunner()
-	delegate := list.NewDefaultDelegate()
-	delegate.SetHeight(1)
-	delegate.SetSpacing(0)
-	delegate.ShowDescription = false
-	delegate.Styles.NormalTitle = lipgloss.NewStyle().Foreground(lipgloss.Color(opt.Theme.Colors.Fg))
-	delegate.Styles.SelectedTitle = lipgloss.NewStyle().Foreground(lipgloss.Color(opt.Theme.Colors.Accent)).Bold(true)
+	delegate := newChangeListDelegate(
+		lipgloss.NewStyle().Foreground(lipgloss.Color(opt.Theme.Colors.Fg)),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(opt.Theme.Colors.Accent)).Bold(true),
+	)
 	changes := list.New(nil, delegate, 0, 0)
 	changes.Title = "Changes"
 	changes.SetShowTitle(false)
@@ -342,7 +340,7 @@ func (m Model) View() string {
 		base = lipgloss.JoinVertical(lipgloss.Left, base, search)
 	}
 
-	return m.styles.Frame.Width(m.width).Height(m.height).Render(base)
+	return m.styles.Frame.Render(base)
 }
 
 func (m *Model) resize() {
@@ -350,13 +348,11 @@ func (m *Model) resize() {
 		return
 	}
 
-	contentHeight := maxInt(m.height-5, 6)
-	leftWidth := maxInt(m.width/3, 30)
-	rightWidth := maxInt(m.width-leftWidth-2, 40)
+	leftWidth, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
 
-	m.changes.SetSize(leftWidth-4, contentHeight-2)
+	m.changes.SetSize(leftWidth-4, paneHeight-2)
 	m.diff.Width = rightWidth - 4
-	m.diff.Height = contentHeight - 2
+	m.diff.Height = paneHeight - 2
 }
 
 func (m *Model) rotateFocus() {
@@ -376,6 +372,7 @@ func (m *Model) renderTopBar() string {
 	if len(m.warn) > 0 {
 		status += fmt.Sprintf(" | warnings: %d", len(m.warn))
 	}
+	status = truncateText(status, maxInt(m.width-2, 10))
 
 	return m.styles.Status.Width(m.width).Render(status)
 }
@@ -396,7 +393,8 @@ func (m *Model) renderChangesPane() string {
 		body = m.styles.Muted.Render("No changes match filters")
 	}
 
-	return pane.Width(maxInt(m.width/3, 30)).Height(maxInt(m.height-3, 8)).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
+	leftWidth, _, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
+	return pane.Width(leftWidth).Height(paneHeight).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
 }
 
 func (m *Model) renderDiffPane() string {
@@ -415,7 +413,8 @@ func (m *Model) renderDiffPane() string {
 		body = m.renderRecentCommits()
 	}
 
-	return pane.Width(maxInt(m.width-maxInt(m.width/3, 30)-1, 40)).Height(maxInt(m.height-3, 8)).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
+	_, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
+	return pane.Width(rightWidth).Height(paneHeight).Render(lipgloss.JoinVertical(lipgloss.Left, title, body))
 }
 
 func (m *Model) renderBottomBar() string {
@@ -614,4 +613,68 @@ func formatDuration(d time.Duration) string {
 	}
 
 	return d.String()
+}
+
+func paneDimensions(totalWidth int, totalHeight int, searchVisible bool) (leftWidth int, rightWidth int, paneHeight int) {
+	if totalWidth < 60 {
+		leftWidth = maxInt(totalWidth/2, 20)
+		rightWidth = maxInt(totalWidth-leftWidth-1, 20)
+	} else {
+		leftWidth = totalWidth / 3
+		if leftWidth < 28 {
+			leftWidth = 28
+		}
+		rightWidth = totalWidth - leftWidth - 1
+		if rightWidth < 30 {
+			rightWidth = 30
+			leftWidth = totalWidth - rightWidth - 1
+			if leftWidth < 20 {
+				leftWidth = 20
+				rightWidth = totalWidth - leftWidth - 1
+			}
+		}
+	}
+
+	if leftWidth < 20 {
+		leftWidth = 20
+	}
+	if rightWidth < 20 {
+		rightWidth = 20
+	}
+	if leftWidth+rightWidth+1 > totalWidth {
+		over := leftWidth + rightWidth + 1 - totalWidth
+		rightWidth -= over
+		if rightWidth < 20 {
+			rightWidth = 20
+		}
+	}
+
+	headerHeight := 1
+	footerHeight := 2
+	if searchVisible {
+		footerHeight++
+	}
+	paneHeight = totalHeight - headerHeight - footerHeight
+	if paneHeight < 5 {
+		paneHeight = 5
+	}
+
+	return leftWidth, rightWidth, paneHeight
+}
+
+func truncateText(input string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+
+	r := []rune(input)
+	if len(r) <= maxLen {
+		return input
+	}
+
+	if maxLen < 2 {
+		return string(r[:maxLen])
+	}
+
+	return string(r[:maxLen-1]) + "…"
 }

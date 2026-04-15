@@ -17,6 +17,7 @@ func main() {
 	themeFlag := flag.String("theme", "", "Theme name from ~/.gitriot/themes")
 	themeFileFlag := flag.String("theme-file", "", "Absolute path to theme YAML file")
 	recentWindowFlag := flag.Duration("recent-window", 0, "Time window around root last commit (example: 90m, 2h)")
+	noAltScreenFlag := flag.Bool("no-alt-screen", false, "Disable alternate screen mode (useful for embedded terminals)")
 	flag.Parse()
 
 	paths, err := config.ResolvePaths()
@@ -69,9 +70,24 @@ func main() {
 		RecentWindow: *recentWindowFlag,
 	}
 
-	p := tea.NewProgram(app.NewModel(modelOption), tea.WithAltScreen())
+	programOptions := []tea.ProgramOption{}
+	if !*noAltScreenFlag && !isEmbeddedTerminal() {
+		programOptions = append(programOptions, tea.WithAltScreen())
+	}
+
+	p := tea.NewProgram(app.NewModel(modelOption), programOptions...)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to run GitRiot: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func isEmbeddedTerminal() bool {
+	v := os.Getenv("TERMINAL_EMULATOR")
+	if v == "JetBrains-JediTerm" {
+		return true
+	}
+
+	v = os.Getenv("TERM_PROGRAM")
+	return v == "JetBrains-JediTerm"
 }
