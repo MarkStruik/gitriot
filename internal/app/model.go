@@ -53,6 +53,8 @@ type Model struct {
 	showRecent    bool
 	recentLoaded  bool
 	showHunksOnly bool
+	scopeBranches map[string]string
+	treeCollapsed map[string]bool
 
 	diff   viewport.Model
 	help   help.Model
@@ -81,11 +83,21 @@ type Model struct {
 
 type treeRow struct {
 	id         string
+	nodeID     string
+	parentID   string
+	depth      int
+	kind       string
 	text       string
 	selectable bool
 	change     *model.ChangeItem
 	commitFile *model.CommitFile
 }
+
+const (
+	treeKindScope = "scope"
+	treeKindDir   = "dir"
+	treeKindFile  = "file"
+)
 
 type treeBuildNode struct {
 	Name     string
@@ -100,6 +112,7 @@ type indexLoadedMsg struct {
 	requestID   int
 	branch      string
 	result      git.IndexResult
+	scopeBranch map[string]string
 	fingerprint string
 	err         error
 }
@@ -119,9 +132,10 @@ type fingerprintCheckedMsg struct {
 }
 
 type recentLoadedMsg struct {
-	requestID int
-	result    git.RecentCommitResult
-	err       error
+	requestID   int
+	result      git.RecentCommitResult
+	scopeBranch map[string]string
+	err         error
 }
 
 type keyMap struct {
@@ -133,6 +147,9 @@ type keyMap struct {
 	FilterUnstaged  key.Binding
 	FilterUntracked key.Binding
 	FilterSubmodule key.Binding
+	CollapseNode    key.Binding
+	ExpandNode      key.Binding
+	ToggleNode      key.Binding
 	ToggleHunksOnly key.Binding
 	Search          key.Binding
 	ToggleRecent    key.Binding
@@ -144,7 +161,7 @@ type keyMap struct {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.FocusSwitch, k.ToggleRecent, k.ToggleHunksOnly, k.Search, k.Quit}
+	return []key.Binding{k.FocusSwitch, k.ToggleRecent, k.CollapseNode, k.ExpandNode, k.ToggleNode, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
@@ -164,6 +181,9 @@ var keys = keyMap{
 	FilterUnstaged:  key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "toggle unstaged")),
 	FilterUntracked: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "toggle untracked")),
 	FilterSubmodule: key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle submodule")),
+	CollapseNode:    key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("←/h", "collapse")),
+	ExpandNode:      key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "expand")),
+	ToggleNode:      key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "toggle")),
 	ToggleHunksOnly: key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "toggle hunks-only")),
 	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "toggle commits")),
 	Search:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
@@ -188,19 +208,21 @@ func NewModel(opt Option) Model {
 	h.ShowAll = false
 
 	return Model{
-		repoPath:     filepath.Clean(opt.RepoPath),
-		styles:       ui.NewStyles(opt.Theme),
-		filters:      DefaultFilters(),
-		runner:       runner,
-		index:        git.NewRepositoryIndexer(runner),
-		diffs:        git.NewDiffLoader(runner),
-		diff:         d,
-		help:         h,
-		search:       s,
-		focus:        focusChanges,
-		message:      "Loading repository status...",
-		recentWindow: opt.RecentWindow,
-		selectedTree: -1,
+		repoPath:      filepath.Clean(opt.RepoPath),
+		styles:        ui.NewStyles(opt.Theme),
+		filters:       DefaultFilters(),
+		runner:        runner,
+		index:         git.NewRepositoryIndexer(runner),
+		diffs:         git.NewDiffLoader(runner),
+		diff:          d,
+		help:          h,
+		search:        s,
+		focus:         focusChanges,
+		message:       "Loading repository status...",
+		recentWindow:  opt.RecentWindow,
+		selectedTree:  -1,
+		scopeBranches: map[string]string{},
+		treeCollapsed: map[string]bool{},
 	}
 }
 
@@ -266,6 +288,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.branch = msg.branch
+		m.scopeBranches = copyStringMap(msg.scopeBranch)
 		m.warn = msg.result.Warnings
 		m.lastFingerprint = msg.fingerprint
 		m.allItems = msg.result.Items
@@ -308,6 +331,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recentLoaded = true
 		m.recentCommits = msg.result.Commits
 		m.recentFiles = msg.result.Files
+		if len(msg.scopeBranch) > 0 {
+			m.scopeBranches = copyStringMap(msg.scopeBranch)
+		}
 		m.warn = append(m.warn, msg.result.Warnings...)
 		m.applyCurrentList()
 		m.diff.SetContent(m.renderRecentSummary())
@@ -374,7 +400,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case key.Matches(msg, keys.CollapseNode):
+			if m.focus == focusChanges {
+				if ok, preserve := m.collapseTreeAtSelection(); ok {
+					m.applyCurrentListWithPreserve(preserve)
+					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+						return m, cmd
+					}
+				}
+				return m, nil
+			}
+		case key.Matches(msg, keys.ExpandNode):
+			if m.focus == focusChanges {
+				if ok, preserve := m.expandTreeAtSelection(); ok {
+					m.applyCurrentListWithPreserve(preserve)
+					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+						return m, cmd
+					}
+				}
+				return m, nil
+			}
+		case key.Matches(msg, keys.ToggleNode):
+			if m.focus == focusChanges {
+				if ok, preserve := m.toggleTreeAtSelection(); ok {
+					m.applyCurrentListWithPreserve(preserve)
+					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+						return m, cmd
+					}
+				}
+				return m, nil
+			}
 		case key.Matches(msg, keys.ToggleHunksOnly):
+			if m.focus != focusDiff {
+				return m, nil
+			}
 			m.showHunksOnly = !m.showHunksOnly
 			if m.showHunksOnly {
 				m.message = "Showing changed hunks with context"
@@ -469,7 +528,7 @@ func (m Model) View() string {
 	top := m.renderTopBar()
 	left := m.renderChangesPane(leftWidth, paneHeight)
 	right := m.renderDiffPane(rightWidth, paneHeight)
-	sep := m.styles.Muted.Render("|")
+	sep := renderVerticalSep(paneHeight)
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right)
 	bottom := m.renderBottomBar()
 
@@ -506,21 +565,8 @@ func (m *Model) rotateFocus() {
 }
 
 func (m *Model) renderTopBar() string {
-	filters := fmt.Sprintf("S:%t U:%t N:%t M:%t H:%t", m.filters.ShowStaged, m.filters.ShowUnstaged, m.filters.ShowUntracked, m.filters.ShowSubmodule, m.showHunksOnly)
-	visible, total := len(m.filteredItems), len(m.allItems)
-	if m.showRecent {
-		visible, total = len(m.recentVisible), len(m.recentFiles)
-	}
-	status := fmt.Sprintf("repo: %s | branch: %s | visible: %d/%d | %s", m.repoPath, valueOr(m.branch, "?"), visible, total, filters)
-	if m.recentWindow > 0 {
-		status += fmt.Sprintf(" | recent: %d (%s)", len(m.recentCommits), formatDuration(m.recentWindow))
-	}
-	if len(m.warn) > 0 {
-		status += fmt.Sprintf(" | warnings: %d", len(m.warn))
-	}
-	status = truncateText(status, maxInt(m.width-2, 10))
-
-	return m.styles.Status.Width(m.width).Render(status)
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#8ec0ff")).Render("GitRiot")
+	return m.styles.Status.Width(m.width).Render(title)
 }
 
 func (m *Model) renderChangesPane(width int, height int) string {
@@ -545,7 +591,11 @@ func (m *Model) renderChangesPane(width int, height int) string {
 	}
 
 	panel := lipgloss.JoinVertical(lipgloss.Left, title, body)
-	return lipgloss.NewStyle().Width(width).Height(maxInt(height, 3)).Render(panel)
+	bg := lipgloss.Color("#22283a")
+	if m.focus == focusChanges {
+		bg = lipgloss.Color("#2a3147")
+	}
+	return lipgloss.NewStyle().Background(bg).Width(width).Height(maxInt(height, 3)).Render(panel)
 }
 
 func (m *Model) renderDiffPane(width int, height int) string {
@@ -564,7 +614,11 @@ func (m *Model) renderDiffPane(width int, height int) string {
 
 	body := m.diff.View()
 	panel := lipgloss.JoinVertical(lipgloss.Left, title, body)
-	return lipgloss.NewStyle().Width(width).Height(maxInt(height, 3)).Render(panel)
+	bg := lipgloss.Color("#2f354b")
+	if m.focus == focusDiff {
+		bg = lipgloss.Color("#353d55")
+	}
+	return lipgloss.NewStyle().Background(bg).Width(width).Height(maxInt(height, 3)).Render(panel)
 }
 
 func (m *Model) renderBottomBar() string {
@@ -573,9 +627,20 @@ func (m *Model) renderBottomBar() string {
 		msg = "Ready"
 	}
 	line := m.styles.Muted.Render(msg)
-	helpLine := "tab switch pane · c commits · h hunks · / search · r refresh · q quit"
+	treeStyle := m.styles.Muted
+	diffStyle := m.styles.Muted
+	if m.focus == focusChanges {
+		treeStyle = m.styles.Title
+	} else if m.focus == focusDiff {
+		diffStyle = m.styles.Title
+	}
+
+	treeSeg := treeStyle.Render("󰙅 TREE  ←/h collapse  →/l expand  ␠ toggle")
+	diffSeg := diffStyle.Render("󰈙 DIFF  h hunks/full")
+	globalSeg := m.styles.Muted.Render("󰌌 GLOBAL  tab pane  c commits  / search  r refresh  q quit")
+	helpLine := treeSeg + m.styles.Muted.Render("   •   ") + diffSeg + m.styles.Muted.Render("   •   ") + globalSeg
 	helpLine = truncateText(helpLine, maxInt(m.width-2, 10))
-	return lipgloss.JoinVertical(lipgloss.Left, line, m.styles.Muted.Render(helpLine))
+	return lipgloss.JoinVertical(lipgloss.Left, line, helpLine)
 }
 
 func (m *Model) loadIndexCmd() tea.Cmd {
@@ -592,6 +657,20 @@ func (m *Model) loadIndexCmd() tea.Cmd {
 		branch, branchErr := git.CurrentBranch(ctx, m.runner, repoPath)
 		fingerprint, fingerprintErr := git.WorkingTreeFingerprint(ctx, m.runner, repoPath)
 		result, err := m.index.IndexAll(ctx, repoPath)
+		scopeBranches := map[string]string{"root": valueOr(branch, "?")}
+		submodules := collectSubmodulePathsFromChanges(result.Items)
+		for _, submodule := range submodules {
+			subDir := gitSubmoduleDir(repoPath, submodule)
+			subBranch, subErr := git.CurrentBranch(ctx, m.runner, subDir)
+			if subErr != nil {
+				scopeBranches[submodule] = "?"
+				if err == nil {
+					result.Warnings = append(result.Warnings, fmt.Sprintf("branch unavailable for %s: %v", submodule, subErr))
+				}
+				continue
+			}
+			scopeBranches[submodule] = valueOr(subBranch, "?")
+		}
 		if branchErr != nil && err == nil {
 			result.Warnings = append(result.Warnings, branchErr.Error())
 		}
@@ -599,7 +678,7 @@ func (m *Model) loadIndexCmd() tea.Cmd {
 			result.Warnings = append(result.Warnings, "fingerprint unavailable: "+fingerprintErr.Error())
 		}
 
-		return indexLoadedMsg{requestID: requestID, branch: branch, result: result, fingerprint: fingerprint, err: err}
+		return indexLoadedMsg{requestID: requestID, branch: branch, result: result, scopeBranch: scopeBranches, fingerprint: fingerprint, err: err}
 	}
 }
 
@@ -669,25 +748,43 @@ func (m *Model) loadRecentCmd() tea.Cmd {
 		defer cancel()
 
 		res, err := git.CollectRecentCommits(ctx, m.runner, repoPath, m.recentWindow)
-		return recentLoadedMsg{requestID: requestID, result: res, err: err}
+		scopeBranches := copyStringMap(m.scopeBranches)
+		submodules := collectSubmodulePathsFromCommitFiles(res.Files)
+		for _, submodule := range submodules {
+			if _, ok := scopeBranches[submodule]; ok {
+				continue
+			}
+			subDir := gitSubmoduleDir(repoPath, submodule)
+			subBranch, subErr := git.CurrentBranch(ctx, m.runner, subDir)
+			if subErr != nil {
+				scopeBranches[submodule] = "?"
+				continue
+			}
+			scopeBranches[submodule] = valueOr(subBranch, "?")
+		}
+		return recentLoadedMsg{requestID: requestID, result: res, scopeBranch: scopeBranches, err: err}
 	}
 }
 
 func (m *Model) applyCurrentList() {
+	m.applyCurrentListWithPreserve("")
+}
+
+func (m *Model) applyCurrentListWithPreserve(previousSelectionID string) {
 	if m.showRecent {
-		m.applyRecentFilesToList()
+		m.applyRecentFilesToList(previousSelectionID)
 		return
 	}
-	m.applyFiltersToList()
+	m.applyFiltersToList(previousSelectionID)
 }
 
-func (m *Model) applyFiltersToList() {
+func (m *Model) applyFiltersToList(previousSelectionID string) {
 	m.filteredItems = ApplyFilters(m.allItems, m.filters)
-	m.treeRows = buildChangeTreeRows(m.filteredItems, m.leftWidth)
-	m.resetSelection()
+	m.treeRows = buildChangeTreeRows(m.filteredItems, m.scopeBranches, m.treeCollapsed)
+	m.restoreSelection(previousSelectionID)
 }
 
-func (m *Model) applyRecentFilesToList() {
+func (m *Model) applyRecentFilesToList(previousSelectionID string) {
 	query := strings.ToLower(strings.TrimSpace(m.filters.Query))
 	filtered := make([]model.CommitFile, 0, len(m.recentFiles))
 	for _, file := range m.recentFiles {
@@ -703,8 +800,8 @@ func (m *Model) applyRecentFilesToList() {
 		filtered = append(filtered, file)
 	}
 	m.recentVisible = filtered
-	m.treeRows = buildRecentTreeRows(filtered, m.leftWidth)
-	m.resetSelection()
+	m.treeRows = buildRecentTreeRows(filtered, m.scopeBranches, m.treeCollapsed)
+	m.restoreSelection(previousSelectionID)
 }
 
 func (m *Model) selectedItem() *model.ChangeItem {
@@ -885,19 +982,10 @@ func (m *Model) autoLoadSelectedDiff() tea.Cmd {
 }
 
 func (m *Model) currentSelectionID() string {
-	if m.showRecent {
-		file := m.selectedRecentFile()
-		if file == nil {
-			return ""
-		}
-		return file.Scope + "|" + file.CommitHash + "|" + file.Path
-	}
-
-	item := m.selectedItem()
-	if item == nil {
+	if m.selectedTree < 0 || m.selectedTree >= len(m.treeRows) {
 		return ""
 	}
-	return item.ScopeLabel() + "|" + string(item.Type) + "|" + item.Path
+	return m.treeRows[m.selectedTree].id
 }
 
 func shortHash(hash string) string {
@@ -1031,14 +1119,28 @@ func renderNumberedLines(lines []string, keep []bool) string {
 }
 
 func (m *Model) renderTreePanel() string {
-	if len(m.treeRows) == 0 {
+	if m.leftHeight <= 0 {
 		return ""
 	}
+	bg := lipgloss.Color("#22283a")
+	selectedBg := lipgloss.Color("#101725")
+	if m.focus == focusChanges {
+		bg = lipgloss.Color("#2a3147")
+		selectedBg = lipgloss.Color("#0d1424")
+	}
+	normalStyle := lipgloss.NewStyle().Background(bg)
+	selectedStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color("#9cc8ff")).Bold(true)
+	folderStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color("#c9d4ee"))
+	fileStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color("#e8edf8"))
+
 	start := m.leftOffset
 	if start < 0 {
 		start = 0
 	}
-	if start >= len(m.treeRows) {
+	if len(m.treeRows) == 0 {
+		start = 0
+	}
+	if len(m.treeRows) > 0 && start >= len(m.treeRows) {
 		start = len(m.treeRows) - 1
 	}
 	end := start + m.leftHeight
@@ -1047,19 +1149,33 @@ func (m *Model) renderTreePanel() string {
 	}
 
 	b := strings.Builder{}
+	renderWidth := maxInt(m.leftWidth, 8)
+	printed := 0
 	for i := start; i < end; i++ {
 		row := m.treeRows[i]
-		line := truncateText(row.text, maxInt(m.leftWidth-2, 4))
+		prefix := "  "
 		if i == m.selectedTree {
-			b.WriteString(m.styles.Title.Render("> " + line))
-		} else if !row.selectable {
-			b.WriteString(m.styles.Muted.Render("  " + line))
-		} else {
-			b.WriteString("  " + line)
+			prefix = "❯ "
 		}
-		if i != end-1 {
+		line := truncateText(prefix+row.text, maxInt(renderWidth, 4))
+		if i == m.selectedTree {
+			b.WriteString(selectedStyle.Width(renderWidth).Render(line))
+		} else if row.kind == treeKindScope || row.kind == treeKindDir {
+			b.WriteString(folderStyle.Width(renderWidth).Render(line))
+		} else {
+			b.WriteString(fileStyle.Width(renderWidth).Render(line))
+		}
+		printed++
+		if printed < m.leftHeight {
 			b.WriteByte('\n')
 		}
+	}
+	for printed < m.leftHeight {
+		if printed > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(normalStyle.Width(renderWidth).Render(""))
+		printed++
 	}
 
 	return b.String()
@@ -1076,6 +1192,22 @@ func (m *Model) resetSelection() {
 		}
 	}
 	m.ensureSelectionVisible()
+}
+
+func (m *Model) restoreSelection(previousSelectionID string) {
+	if previousSelectionID == "" {
+		m.resetSelection()
+		return
+	}
+	m.lastSelID = ""
+	for i, row := range m.treeRows {
+		if row.id == previousSelectionID {
+			m.selectedTree = i
+			m.ensureSelectionVisible()
+			return
+		}
+	}
+	m.resetSelection()
 }
 
 func (m *Model) moveSelection(delta int) {
@@ -1121,7 +1253,77 @@ func (m *Model) ensureSelectionVisible() {
 	}
 }
 
-func buildChangeTreeRows(changes []model.ChangeItem, width int) []treeRow {
+func (m *Model) collapseTreeAtSelection() (bool, string) {
+	if m.selectedTree < 0 || m.selectedTree >= len(m.treeRows) {
+		return false, ""
+	}
+	row := m.treeRows[m.selectedTree]
+	target := row.nodeID
+	if row.kind == treeKindFile {
+		target = row.parentID
+	}
+	if target == "" {
+		return false, ""
+	}
+	if m.treeCollapsed[target] {
+		parentID := m.parentNodeID(target)
+		if parentID == "" {
+			return false, ""
+		}
+		target = parentID
+	}
+	m.treeCollapsed[target] = true
+	return true, target
+}
+
+func (m *Model) expandTreeAtSelection() (bool, string) {
+	if m.selectedTree < 0 || m.selectedTree >= len(m.treeRows) {
+		return false, ""
+	}
+	row := m.treeRows[m.selectedTree]
+	target := row.nodeID
+	if row.kind == treeKindFile {
+		target = row.parentID
+	}
+	if target == "" {
+		return false, ""
+	}
+	if !m.treeCollapsed[target] {
+		return false, ""
+	}
+	m.treeCollapsed[target] = false
+	return true, row.id
+}
+
+func (m *Model) toggleTreeAtSelection() (bool, string) {
+	if m.selectedTree < 0 || m.selectedTree >= len(m.treeRows) {
+		return false, ""
+	}
+	row := m.treeRows[m.selectedTree]
+	target := row.nodeID
+	if row.kind == treeKindFile {
+		target = row.parentID
+	}
+	if target == "" {
+		return false, ""
+	}
+	m.treeCollapsed[target] = !m.treeCollapsed[target]
+	if m.treeCollapsed[target] {
+		return true, target
+	}
+	return true, row.id
+}
+
+func (m *Model) parentNodeID(nodeID string) string {
+	for _, row := range m.treeRows {
+		if row.nodeID == nodeID {
+			return row.parentID
+		}
+	}
+	return ""
+}
+
+func buildChangeTreeRows(changes []model.ChangeItem, scopeBranches map[string]string, collapsed map[string]bool) []treeRow {
 	roots := map[string]*treeBuildNode{}
 	rootOrder := []string{}
 	for _, c := range changes {
@@ -1139,19 +1341,30 @@ func buildChangeTreeRows(changes []model.ChangeItem, width int) []treeRow {
 	rows := make([]treeRow, 0, len(changes)+len(rootOrder))
 	for _, scope := range rootOrder {
 		r := roots[scope]
-		header := "/"
-		if scope != "root" {
-			header = scope
+		nodeID := "scope|" + scope
+		expanded := !collapsed[nodeID]
+		icon := "▾"
+		if !expanded {
+			icon = "▸"
 		}
-		rows = append(rows, treeRow{id: "scope|" + scope, text: "▾ " + header, selectable: false})
-		rows = append(rows, flattenChangeNodeRows(r, 1)...)
+		header := scopeNodeLabel(scope, scopeBranches)
+		rows = append(rows, treeRow{
+			id:       nodeID,
+			nodeID:   nodeID,
+			parentID: "",
+			depth:    0,
+			kind:     treeKindScope,
+			text:     icon + " " + header,
+		})
+		if expanded {
+			rows = append(rows, flattenChangeNodeRows(r, 1, nodeID, scope, collapsed)...)
+		}
 	}
 
-	_ = width
 	return rows
 }
 
-func flattenChangeNodeRows(n *treeBuildNode, depth int) []treeRow {
+func flattenChangeNodeRows(n *treeBuildNode, depth int, parentID string, scope string, collapsed map[string]bool) []treeRow {
 	rows := []treeRow{}
 	folderNames := make([]string, 0, len(n.Folders))
 	for k := range n.Folders {
@@ -1161,8 +1374,23 @@ func flattenChangeNodeRows(n *treeBuildNode, depth int) []treeRow {
 	indent := strings.Repeat("  ", depth)
 	for _, name := range folderNames {
 		child := n.Folders[name]
-		rows = append(rows, treeRow{id: "dir|" + child.Path, text: indent + "▾ " + name, selectable: false})
-		rows = append(rows, flattenChangeNodeRows(child, depth+1)...)
+		nodeID := "dir|" + scope + "|" + child.Path
+		expanded := !collapsed[nodeID]
+		icon := "▾"
+		if !expanded {
+			icon = "▸"
+		}
+		rows = append(rows, treeRow{
+			id:       nodeID,
+			nodeID:   nodeID,
+			parentID: parentID,
+			depth:    depth,
+			kind:     treeKindDir,
+			text:     indent + icon + " " + name,
+		})
+		if expanded {
+			rows = append(rows, flattenChangeNodeRows(child, depth+1, nodeID, scope, collapsed)...)
+		}
 	}
 
 	sort.SliceStable(n.Files, func(i int, j int) bool {
@@ -1172,6 +1400,10 @@ func flattenChangeNodeRows(n *treeBuildNode, depth int) []treeRow {
 		copy := f
 		rows = append(rows, treeRow{
 			id:         "file|" + f.ScopeLabel() + "|" + string(f.Type) + "|" + f.Path,
+			nodeID:     "file|" + f.ScopeLabel() + "|" + f.Path,
+			parentID:   parentID,
+			depth:      depth,
+			kind:       treeKindFile,
 			text:       indent + statusLetter(f.Type) + " " + baseName(f.Path),
 			selectable: true,
 			change:     &copy,
@@ -1202,7 +1434,7 @@ func insertChangeNode(root *treeBuildNode, change model.ChangeItem) {
 	cur.Files = append(cur.Files, change)
 }
 
-func buildRecentTreeRows(files []model.CommitFile, width int) []treeRow {
+func buildRecentTreeRows(files []model.CommitFile, scopeBranches map[string]string, collapsed map[string]bool) []treeRow {
 	changes := make([]model.ChangeItem, 0, len(files))
 	fileMap := map[string]model.CommitFile{}
 	for _, f := range files {
@@ -1211,30 +1443,28 @@ func buildRecentTreeRows(files []model.CommitFile, width int) []treeRow {
 		key := f.Scope + "|" + f.Path
 		fileMap[key] = f
 	}
-	rows := buildChangeTreeRows(changes, width)
+	rows := buildChangeTreeRows(changes, scopeBranches, collapsed)
 	for i := range rows {
 		if rows[i].change != nil {
 			key := rows[i].change.ScopeLabel() + "|" + rows[i].change.Path
 			if f, ok := fileMap[key]; ok {
 				copy := f
-				leaf := baseName(f.Path)
 				rows[i].commitFile = &copy
 				rows[i].change = nil
 				rows[i].id = "recent|" + f.Scope + "|" + f.CommitHash + "|" + f.Path
-				rows[i].text = strings.Repeat("  ", treeDepthFromText(rows[i].text)) + shortHash(f.CommitHash) + " " + leaf
+				rows[i].text = strings.Repeat("  ", rows[i].depth) + shortHash(f.CommitHash) + " " + baseName(f.Path)
 			}
 		}
 	}
 	return rows
 }
 
-func treeDepthFromText(line string) int {
-	depth := 0
-	for strings.HasPrefix(line, "  ") {
-		depth++
-		line = line[2:]
+func scopeNodeLabel(scope string, scopeBranches map[string]string) string {
+	branch := valueOr(scopeBranches[scope], "?")
+	if scope == "root" {
+		return fmt.Sprintf("/ (%s)", branch)
 	}
-	return depth
+	return fmt.Sprintf("%s (%s)", scope, branch)
 }
 
 func statusLetter(t model.ChangeType) string {
@@ -1272,4 +1502,58 @@ func pathParts(path string) []string {
 		}
 	}
 	return out
+}
+
+func collectSubmodulePathsFromChanges(items []model.ChangeItem) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, item := range items {
+		if item.SubmodulePath == "" {
+			continue
+		}
+		if _, ok := seen[item.SubmodulePath]; ok {
+			continue
+		}
+		seen[item.SubmodulePath] = struct{}{}
+		out = append(out, item.SubmodulePath)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func collectSubmodulePathsFromCommitFiles(files []model.CommitFile) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, file := range files {
+		if file.SubmodulePath == "" {
+			continue
+		}
+		if _, ok := seen[file.SubmodulePath]; ok {
+			continue
+		}
+		seen[file.SubmodulePath] = struct{}{}
+		out = append(out, file.SubmodulePath)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func gitSubmoduleDir(repoRoot string, submodulePath string) string {
+	return filepath.Join(repoRoot, filepath.FromSlash(submodulePath))
+}
+
+func copyStringMap(src map[string]string) map[string]string {
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func renderVerticalSep(height int) string {
+	if height <= 0 {
+		return ""
+	}
+	line := strings.Repeat("|\n", height)
+	return strings.TrimRight(line, "\n")
 }

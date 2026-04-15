@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1.7
+FROM golang:1.24
+
+WORKDIR /src
+
+ENV PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ENV GOPROXY=direct
+ENV GOSUMDB=off
+ENV GOINSECURE=github.com/*,golang.org/*,gopkg.in/*
+ENV GIT_SSL_NO_VERIFY=1
+
+CMD ["sh", "-lc", "mkdir -p publish && /usr/local/go/bin/go mod download && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 /usr/local/go/bin/go build -o publish/gitriot.exe ./cmd/gitriot"]

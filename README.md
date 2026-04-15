@@ -29,6 +29,15 @@ docker run --rm -it -v "${PWD}:/src" -w /src golang:1.24 sh -c "go run ./cmd/git
 docker run --rm -v "${PWD}:/src" -w /src golang:1.24 sh -c "mkdir -p publish && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o publish/gitriot.exe ./cmd/gitriot"
 ```
 
+Faster cached build with Docker volumes:
+```powershell
+./scripts/build.ps1
+```
+
+This uses persistent Docker volumes for:
+- `/go/pkg/mod` (module download cache)
+- `/root/.cache/go-build` (compiled build cache)
+
 ## Configuration
 - Config file: `~/.gitriot/config.yaml`
 - Theme files: `~/.gitriot/themes/<name>.yaml`
@@ -57,8 +66,11 @@ colors:
 - `q` / `ctrl+c`: quit
 - `tab`: switch focus between change list and diff pane
 - `j` / `k` or arrows: move selection
+- `left` / `h` (tree pane): collapse folder or move up
+- `right` / `l` (tree pane): expand folder
+- `space` (tree pane): toggle folder collapse
 - `enter`: reload diff for current selection
-- `h`: toggle full-file vs hunks-only view (hunks show +/- 5 context lines)
+- `h` (diff pane): toggle full-file vs hunks-only view (hunks show +/- 5 context lines)
 - `s`: toggle staged changes
 - `u`: toggle unstaged changes
 - `n`: toggle untracked changes
