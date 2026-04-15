@@ -472,7 +472,7 @@ func (m Model) View() string {
 		base = lipgloss.JoinVertical(lipgloss.Left, base, search)
 	}
 
-	return m.styles.Frame.Render(base)
+	return m.styles.Frame.Width(m.width).Height(m.height).MaxWidth(m.width).MaxHeight(m.height).Render(base)
 }
 
 func (m *Model) resize() {
@@ -565,7 +565,9 @@ func (m *Model) renderBottomBar() string {
 		msg = "Ready"
 	}
 	line := m.styles.Muted.Render(msg)
-	return lipgloss.JoinVertical(lipgloss.Left, line, m.help.View(keys))
+	helpLine := "tab switch pane · c commits · h hunks · / search · r refresh · q quit"
+	helpLine = truncateText(helpLine, maxInt(m.width-2, 10))
+	return lipgloss.JoinVertical(lipgloss.Left, line, m.styles.Muted.Render(helpLine))
 }
 
 func (m *Model) loadIndexCmd() tea.Cmd {
