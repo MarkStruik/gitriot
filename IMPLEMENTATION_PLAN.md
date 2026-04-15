@@ -5,7 +5,7 @@
 - [x] Step 1: Bootstrap Go module and Bubble Tea app skeleton
 - [x] Step 2: Define core domain models for changes and diffs
 - [x] Step 3: Build Git command runner abstraction
-- [ ] Step 4: Implement main repository status indexer
+- [x] Step 4: Implement main repository status indexer
 - [ ] Step 5: Implement submodule discovery and indexing
 - [ ] Step 6: Build diff loading service (staged/unstaged)
 - [ ] Step 7: Add theme token system (single theme, extensible)
@@ -19,7 +19,7 @@
 - [ ] Step 15: Add tests, docs, and release notes
 
 ## Build/Release Rule per Implementation Phase
-- At the end of each completed implementation phase, produce a Windows executable at `publish/gitriot.exe`.
+- Build `publish/gitriot.exe` at natural pause checkpoints ("stop for air" moments) instead of after every single step.
 - The `publish/` directory is intentionally excluded from Git tracking.
 
 ## Current Status Notes
@@ -28,6 +28,7 @@
 - Build is executed in Docker using `golang:1.24` to stay aligned with the latest toolchain baseline.
 - Step 2 completed with shared domain models in `internal/model/change.go` and `internal/model/diff.go`.
 - Step 3 completed with Git CLI runner abstraction in `internal/git/runner.go`.
+- Step 4 completed with porcelain status parsing in `internal/git/status.go`.
 
 ## Delivery Workflow
 1. Complete one step from the tracker.
