@@ -1183,33 +1183,34 @@ func truncateText(input string, maxLen int) string {
 
 func renderFileWithHunks(path string, fullContent string, changed []git.LineRange, decor map[int]git.LineDecoration, hunksOnly bool, contextLines int) string {
 	highlighted := ui.HighlightForPath(path, fullContent)
-	lines := strings.Split(highlighted, "\n")
+	highlightedLines := strings.Split(highlighted, "\n")
+	rawLines := strings.Split(fullContent, "\n")
 	if !hunksOnly || len(changed) == 0 {
-		return renderNumberedLines(lines, nil, decor)
+		return renderNumberedLines(rawLines, highlightedLines, nil, decor)
 	}
 
-	keep := make([]bool, len(lines))
+	keep := make([]bool, len(rawLines))
 	for _, h := range changed {
 		start := h.Start - contextLines
 		end := h.End + contextLines
 		if start < 1 {
 			start = 1
 		}
-		if end > len(lines) {
-			end = len(lines)
+		if end > len(rawLines) {
+			end = len(rawLines)
 		}
 		for i := start; i <= end; i++ {
 			keep[i-1] = true
 		}
 	}
 
-	return renderNumberedLines(lines, keep, decor)
+	return renderNumberedLines(rawLines, highlightedLines, keep, decor)
 }
 
-func renderNumberedLines(lines []string, keep []bool, decor map[int]git.LineDecoration) string {
+func renderNumberedLines(rawLines []string, highlightedLines []string, keep []bool, decor map[int]git.LineDecoration) string {
 	b := strings.Builder{}
 	skipped := false
-	for i, line := range lines {
+	for i, rawLine := range rawLines {
 		if keep != nil && !keep[i] {
 			skipped = true
 			continue
@@ -1220,31 +1221,35 @@ func renderNumberedLines(lines []string, keep []bool, decor map[int]git.LineDeco
 		}
 		if d, ok := decor[i+1]; ok && len(d.DeletedLines) > 0 {
 			for _, deletedLine := range d.DeletedLines {
-				deletedRow := fmt.Sprintf("\x1b[31m-\x1b[0m %6s │ %s", "", deletedLine)
-				deletedRow = "\x1b[48;5;52m" + deletedRow + "\x1b[0m"
+				deletedRow := fmt.Sprintf("- %6s │ %s", "", deletedLine)
+				deletedRow = "\x1b[48;5;52m" + deletedRow
 				b.WriteString(deletedRow + "\n")
 			}
+		}
+		line := rawLine
+		if i < len(highlightedLines) {
+			line = highlightedLines[i]
 		}
 		marker := " "
 		if d, ok := decor[i+1]; ok {
 			switch {
 			case d.Added && d.Deleted:
-				marker = "\x1b[32m+\x1b[0m"
+				marker = "+"
 			case d.Added:
-				marker = "\x1b[32m+\x1b[0m"
+				marker = "+"
 			case d.Deleted:
-				marker = "\x1b[31m-\x1b[0m"
+				marker = "-"
 			}
 		}
 		rowText := fmt.Sprintf("%s %6d │ %s", marker, i+1, line)
 		if d, ok := decor[i+1]; ok {
 			switch {
 			case d.Added && d.Deleted:
-				rowText = "\x1b[48;5;22m" + rowText + "\x1b[0m"
+				rowText = "\x1b[48;5;22m" + fmt.Sprintf("+ %6d │ %s", i+1, rawLine)
 			case d.Added:
-				rowText = "\x1b[48;5;22m" + rowText + "\x1b[0m"
+				rowText = "\x1b[48;5;22m" + fmt.Sprintf("+ %6d │ %s", i+1, rawLine)
 			case d.Deleted:
-				rowText = "\x1b[48;5;52m" + rowText + "\x1b[0m"
+				rowText = "\x1b[48;5;52m" + fmt.Sprintf("- %6d │ %s", i+1, rawLine)
 			}
 		}
 		b.WriteString(rowText + "\n")
@@ -1276,7 +1281,11 @@ func (m *Model) refreshDiffViewport() {
 	b := strings.Builder{}
 	for i, line := range m.diffRawLines {
 		visible := ansi.Cut(line, m.diffXOffset, m.diffXOffset+width)
-		b.WriteString(visible)
+		w := ansi.StringWidth(visible)
+		if w < width {
+			visible = visible + strings.Repeat(" ", width-w)
+		}
+		b.WriteString("\x1b[0m" + visible + "\x1b[0m")
 		if i < len(m.diffRawLines)-1 {
 			b.WriteByte('\n')
 		}
