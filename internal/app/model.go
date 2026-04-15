@@ -365,7 +365,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, keys.Quit):
-			return m, tea.Quit
+			return m, tea.Batch(tea.ClearScreen, tea.Quit)
 		case key.Matches(msg, keys.FocusSwitch):
 			m.rotateFocus()
 			return m, nil
@@ -464,6 +464,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.applyCurrentList()
 			return m, nil
 		case key.Matches(msg, keys.Open):
+			if m.selectedTree >= 0 && m.selectedTree < len(m.treeRows) {
+				row := m.treeRows[m.selectedTree]
+				if row.kind == treeKindScope || row.kind == treeKindDir {
+					if ok, preserve := m.toggleTreeAtSelection(); ok {
+						m.applyCurrentListWithPreserve(preserve)
+					}
+					return m, nil
+				}
+			}
 			if m.showRecent {
 				file := m.selectedRecentFile()
 				if file == nil {
@@ -1184,12 +1193,10 @@ func (m *Model) renderTreePanel() string {
 func (m *Model) resetSelection() {
 	m.lastSelID = ""
 	m.leftOffset = 0
-	m.selectedTree = -1
-	for i, row := range m.treeRows {
-		if row.selectable {
-			m.selectedTree = i
-			break
-		}
+	if len(m.treeRows) == 0 {
+		m.selectedTree = -1
+	} else {
+		m.selectedTree = 0
 	}
 	m.ensureSelectionVisible()
 }
@@ -1218,16 +1225,14 @@ func (m *Model) moveSelection(delta int) {
 		m.resetSelection()
 		return
 	}
-
-	i := m.selectedTree + delta
-	for i >= 0 && i < len(m.treeRows) {
-		if m.treeRows[i].selectable {
-			m.selectedTree = i
-			m.ensureSelectionVisible()
-			return
-		}
-		i += delta
+	m.selectedTree += delta
+	if m.selectedTree < 0 {
+		m.selectedTree = 0
 	}
+	if m.selectedTree >= len(m.treeRows) {
+		m.selectedTree = len(m.treeRows) - 1
+	}
+	m.ensureSelectionVisible()
 }
 
 func (m *Model) pageSelection(direction int) {
@@ -1349,12 +1354,13 @@ func buildChangeTreeRows(changes []model.ChangeItem, scopeBranches map[string]st
 		}
 		header := scopeNodeLabel(scope, scopeBranches)
 		rows = append(rows, treeRow{
-			id:       nodeID,
-			nodeID:   nodeID,
-			parentID: "",
-			depth:    0,
-			kind:     treeKindScope,
-			text:     icon + " " + header,
+			id:         nodeID,
+			nodeID:     nodeID,
+			parentID:   "",
+			depth:      0,
+			kind:       treeKindScope,
+			text:       icon + " " + header,
+			selectable: true,
 		})
 		if expanded {
 			rows = append(rows, flattenChangeNodeRows(r, 1, nodeID, scope, collapsed)...)
@@ -1381,12 +1387,13 @@ func flattenChangeNodeRows(n *treeBuildNode, depth int, parentID string, scope s
 			icon = "▸"
 		}
 		rows = append(rows, treeRow{
-			id:       nodeID,
-			nodeID:   nodeID,
-			parentID: parentID,
-			depth:    depth,
-			kind:     treeKindDir,
-			text:     indent + icon + " " + name,
+			id:         nodeID,
+			nodeID:     nodeID,
+			parentID:   parentID,
+			depth:      depth,
+			kind:       treeKindDir,
+			text:       indent + icon + " " + name,
+			selectable: true,
 		})
 		if expanded {
 			rows = append(rows, flattenChangeNodeRows(child, depth+1, nodeID, scope, collapsed)...)
