@@ -57,7 +57,8 @@ colors:
 - `q` / `ctrl+c`: quit
 - `tab`: switch focus between change list and diff pane
 - `j` / `k` or arrows: move selection
-- `enter`: load diff for selected change
+- `enter`: reload diff for current selection
+- `h`: toggle full-file vs hunks-only view (hunks show +/- 5 context lines)
 - `s`: toggle staged changes
 - `u`: toggle unstaged changes
 - `n`: toggle untracked changes
@@ -71,4 +72,5 @@ colors:
 - GitRiot currently shells out to native Git CLI commands.
 - Submodule failures are reported as warnings; the app remains interactive.
 - Recent commit view is anchored to the root repository last commit and includes submodules whose last commit time is within the provided window.
+- In recent mode, the left pane lists files from those commits and selecting a file auto-loads its commit diff.
 - Embedded terminals (for example Rider/JetBrains terminal) may render better with `--no-alt-screen`.

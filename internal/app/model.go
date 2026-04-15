@@ -51,6 +51,8 @@ type Model struct {
 	recentVisible []model.CommitFile
 	recentWindow  time.Duration
 	showRecent    bool
+	recentLoaded  bool
+	showHunksOnly bool
 
 	changes list.Model
 	diff    viewport.Model
@@ -66,9 +68,10 @@ type Model struct {
 	message string
 	warn    []string
 
-	requestID int
-	lastSelID string
-	activeRef string
+	requestID       int
+	lastSelID       string
+	activeRef       string
+	lastFingerprint string
 }
 
 type changeListItem struct {
@@ -97,20 +100,32 @@ func (r recentFileListItem) FilterValue() string {
 }
 
 type indexLoadedMsg struct {
-	requestID int
-	branch    string
-	result    git.IndexResult
-	recent    git.RecentCommitResult
-	err       error
+	requestID   int
+	branch      string
+	result      git.IndexResult
+	fingerprint string
+	err         error
 }
 
 type diffLoadedMsg struct {
 	requestID int
-	result    model.DiffResult
+	view      string
+	isBinary  bool
+	empty     bool
 	err       error
 }
 
 type refreshTickMsg time.Time
+type fingerprintCheckedMsg struct {
+	fingerprint string
+	err         error
+}
+
+type recentLoadedMsg struct {
+	requestID int
+	result    git.RecentCommitResult
+	err       error
+}
 
 type keyMap struct {
 	Quit            key.Binding
@@ -121,6 +136,7 @@ type keyMap struct {
 	FilterUnstaged  key.Binding
 	FilterUntracked key.Binding
 	FilterSubmodule key.Binding
+	ToggleHunksOnly key.Binding
 	Search          key.Binding
 	ToggleRecent    key.Binding
 	CloseSearch     key.Binding
@@ -131,13 +147,13 @@ type keyMap struct {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.FocusSwitch, k.ToggleRecent, k.Search, k.Refresh, k.Quit}
+	return []key.Binding{k.FocusSwitch, k.ToggleRecent, k.ToggleHunksOnly, k.Search, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.FocusSwitch},
-		{k.FilterStaged, k.FilterUnstaged, k.FilterUntracked, k.FilterSubmodule},
+		{k.FilterStaged, k.FilterUnstaged, k.FilterUntracked, k.FilterSubmodule, k.ToggleHunksOnly},
 		{k.ToggleRecent, k.Search, k.CloseSearch, k.Refresh, k.Quit},
 	}
 }
@@ -151,6 +167,7 @@ var keys = keyMap{
 	FilterUnstaged:  key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "toggle unstaged")),
 	FilterUntracked: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "toggle untracked")),
 	FilterSubmodule: key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle submodule")),
+	ToggleHunksOnly: key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "toggle hunks-only")),
 	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "toggle commits")),
 	Search:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
 	CloseSearch:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "close search")),
@@ -203,7 +220,7 @@ func NewModel(opt Option) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.loadIndexCmd(), m.periodicRefreshCmd())
+	return tea.Batch(m.loadIndexCmd(), m.refreshTickCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -240,9 +257,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case refreshTickMsg:
 		if m.loading {
-			return m, m.periodicRefreshCmd()
+			return m, m.refreshTickCmd()
 		}
-		return m, tea.Batch(m.loadIndexCmd(), m.periodicRefreshCmd())
+		return m, m.checkFingerprintCmd()
+	case fingerprintCheckedMsg:
+		if msg.err != nil {
+			m.warn = append(m.warn, "background refresh failed: "+msg.err.Error())
+			return m, m.refreshTickCmd()
+		}
+		if msg.fingerprint == m.lastFingerprint {
+			return m, m.refreshTickCmd()
+		}
+		return m, tea.Batch(m.loadIndexCmd(), m.refreshTickCmd())
 	case indexLoadedMsg:
 		if msg.requestID != m.requestID {
 			return m, nil
@@ -256,27 +282,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.branch = msg.branch
 		m.warn = msg.result.Warnings
-		m.warn = append(m.warn, msg.recent.Warnings...)
+		m.lastFingerprint = msg.fingerprint
 		m.allItems = msg.result.Items
-		m.recentCommits = msg.recent.Commits
-		m.recentFiles = msg.recent.Files
 		if len(m.allItems) == 0 && m.recentWindow > 0 {
 			m.showRecent = true
+		}
+		if !m.showRecent {
+			m.recentVisible = nil
 		}
 		m.applyCurrentList()
 		if m.showRecent {
 			m.diff.SetContent(m.renderRecentSummary())
 			m.activeRef = "recent snapshot"
-			m.message = fmt.Sprintf("Loaded %d files from recent commits", len(m.recentVisible))
-			if cmd := m.autoLoadSelectedDiff(); cmd != nil {
-				return m, cmd
+			if m.recentLoaded {
+				m.message = fmt.Sprintf("Loaded %d files from recent commits", len(m.recentVisible))
+				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+					return m, tea.Batch(cmd, m.refreshTickCmd())
+				}
+			} else {
+				m.message = "Loading recent commits..."
+				return m, tea.Batch(m.loadRecentCmd(), m.refreshTickCmd())
 			}
 		} else {
 			m.activeRef = ""
 			m.message = fmt.Sprintf("Loaded %d changes", len(m.allItems))
 			if cmd := m.autoLoadSelectedDiff(); cmd != nil {
-				return m, cmd
+				return m, tea.Batch(cmd, m.refreshTickCmd())
 			}
+		}
+		return m, m.refreshTickCmd()
+	case recentLoadedMsg:
+		if msg.requestID != m.requestID {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.warn = append(m.warn, "recent commits unavailable: "+msg.err.Error())
+			m.message = "Unable to load recent commits"
+			return m, nil
+		}
+		m.recentLoaded = true
+		m.recentCommits = msg.result.Commits
+		m.recentFiles = msg.result.Files
+		m.warn = append(m.warn, msg.result.Warnings...)
+		m.applyCurrentList()
+		m.diff.SetContent(m.renderRecentSummary())
+		m.message = fmt.Sprintf("Loaded %d files from recent commits", len(m.recentVisible))
+		if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+			return m, cmd
 		}
 		return m, nil
 	case diffLoadedMsg:
@@ -290,10 +342,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		m.diff.SetContent(m.renderDiff(msg.result))
-		if msg.result.IsBinary {
+		m.diff.SetContent(msg.view)
+		if msg.isBinary {
 			m.message = "Binary diff loaded"
-		} else if msg.result.Empty {
+		} else if msg.empty {
 			m.message = "No diff output for selected item"
 		} else {
 			m.message = "Diff loaded"
@@ -320,6 +372,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.applyCurrentList()
 				m.diff.SetContent(m.renderRecentSummary())
 				m.activeRef = "recent snapshot"
+				if !m.recentLoaded {
+					m.message = "Loading recent commits..."
+					return m, m.loadRecentCmd()
+				}
 				m.message = fmt.Sprintf("Showing %d recent commit files", len(m.recentVisible))
 				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 					return m, cmd
@@ -331,6 +387,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 					return m, cmd
 				}
+			}
+			return m, nil
+		case key.Matches(msg, keys.ToggleHunksOnly):
+			m.showHunksOnly = !m.showHunksOnly
+			if m.showHunksOnly {
+				m.message = "Showing changed hunks with context"
+			} else {
+				m.message = "Showing full file"
+			}
+			if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+				return m, cmd
 			}
 			return m, nil
 		case key.Matches(msg, keys.Refresh):
@@ -429,7 +496,7 @@ func (m *Model) rotateFocus() {
 }
 
 func (m *Model) renderTopBar() string {
-	filters := fmt.Sprintf("S:%t U:%t N:%t M:%t", m.filters.ShowStaged, m.filters.ShowUnstaged, m.filters.ShowUntracked, m.filters.ShowSubmodule)
+	filters := fmt.Sprintf("S:%t U:%t N:%t M:%t H:%t", m.filters.ShowStaged, m.filters.ShowUnstaged, m.filters.ShowUntracked, m.filters.ShowSubmodule, m.showHunksOnly)
 	visible, total := len(m.filteredItems), len(m.allItems)
 	if m.showRecent {
 		visible, total = len(m.recentVisible), len(m.recentFiles)
@@ -504,6 +571,7 @@ func (m *Model) renderBottomBar() string {
 func (m *Model) loadIndexCmd() tea.Cmd {
 	m.loading = true
 	m.requestID++
+	m.recentLoaded = false
 	requestID := m.requestID
 	repoPath := m.repoPath
 
@@ -512,19 +580,16 @@ func (m *Model) loadIndexCmd() tea.Cmd {
 		defer cancel()
 
 		branch, branchErr := git.CurrentBranch(ctx, m.runner, repoPath)
+		fingerprint, fingerprintErr := git.WorkingTreeFingerprint(ctx, m.runner, repoPath)
 		result, err := m.index.IndexAll(ctx, repoPath)
-		recent, recentErr := git.RecentCommitResult{}, error(nil)
-		if m.recentWindow > 0 {
-			recent, recentErr = git.CollectRecentCommits(ctx, m.runner, repoPath, m.recentWindow)
-		}
 		if branchErr != nil && err == nil {
 			result.Warnings = append(result.Warnings, branchErr.Error())
 		}
-		if recentErr != nil && err == nil {
-			result.Warnings = append(result.Warnings, "recent commits unavailable: "+recentErr.Error())
+		if fingerprintErr != nil && err == nil {
+			result.Warnings = append(result.Warnings, "fingerprint unavailable: "+fingerprintErr.Error())
 		}
 
-		return indexLoadedMsg{requestID: requestID, branch: branch, result: result, recent: recent, err: err}
+		return indexLoadedMsg{requestID: requestID, branch: branch, result: result, fingerprint: fingerprint, err: err}
 	}
 }
 
@@ -540,19 +605,60 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 	}
 
 	m.diff.SetContent("Loading diff...")
+	showHunksOnly := m.showHunksOnly
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
 
 		result, err := m.diffs.Load(ctx, req)
-		return diffLoadedMsg{requestID: requestID, result: result, err: err}
+		if err != nil {
+			return diffLoadedMsg{requestID: requestID, err: err}
+		}
+
+		if result.IsBinary {
+			return diffLoadedMsg{requestID: requestID, view: "Binary file diff", isBinary: true, empty: result.Empty}
+		}
+
+		full, fullErr := m.diffs.LoadWorkingFile(req)
+		if fullErr != nil {
+			return diffLoadedMsg{requestID: requestID, err: fullErr}
+		}
+
+		view := renderFileWithHunks(full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
+		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
 	}
 }
 
-func (m *Model) periodicRefreshCmd() tea.Cmd {
-	return tea.Tick(15*time.Second, func(t time.Time) tea.Msg {
+func (m *Model) refreshTickCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return refreshTickMsg(t)
 	})
+}
+
+func (m *Model) checkFingerprintCmd() tea.Cmd {
+	repoPath := m.repoPath
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		fp, err := git.WorkingTreeFingerprint(ctx, m.runner, repoPath)
+		return fingerprintCheckedMsg{fingerprint: fp, err: err}
+	}
+}
+
+func (m *Model) loadRecentCmd() tea.Cmd {
+	if m.recentWindow <= 0 {
+		return nil
+	}
+	requestID := m.requestID
+	repoPath := m.repoPath
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+
+		res, err := git.CollectRecentCommits(ctx, m.runner, repoPath, m.recentWindow)
+		return recentLoadedMsg{requestID: requestID, result: res, err: err}
+	}
 }
 
 func (m *Model) applyCurrentList() {
@@ -731,12 +837,26 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 	}
 
 	m.diff.SetContent("Loading commit diff...")
+	showHunksOnly := m.showHunksOnly
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
 
 		result, err := m.diffs.LoadCommit(ctx, req)
-		return diffLoadedMsg{requestID: requestID, result: result, err: err}
+		if err != nil {
+			return diffLoadedMsg{requestID: requestID, err: err}
+		}
+		if result.IsBinary {
+			return diffLoadedMsg{requestID: requestID, view: "Binary file diff", isBinary: true, empty: result.Empty}
+		}
+
+		full, fullErr := m.diffs.LoadCommitFile(ctx, req)
+		if fullErr != nil {
+			return diffLoadedMsg{requestID: requestID, err: fullErr}
+		}
+
+		view := renderFileWithHunks(full, git.ParseChangedLineRangesFromPatch(result.Patch), showHunksOnly, 5)
+		return diffLoadedMsg{requestID: requestID, view: view, empty: result.Empty}
 	}
 }
 
@@ -862,4 +982,50 @@ func truncateText(input string, maxLen int) string {
 	}
 
 	return string(r[:maxLen-1]) + "…"
+}
+
+func renderFileWithHunks(fullContent string, changed []git.LineRange, hunksOnly bool, contextLines int) string {
+	lines := strings.Split(fullContent, "\n")
+	if !hunksOnly || len(changed) == 0 {
+		return renderNumberedLines(lines, nil)
+	}
+
+	keep := make([]bool, len(lines))
+	for _, h := range changed {
+		start := h.Start - contextLines
+		end := h.End + contextLines
+		if start < 1 {
+			start = 1
+		}
+		if end > len(lines) {
+			end = len(lines)
+		}
+		for i := start; i <= end; i++ {
+			keep[i-1] = true
+		}
+	}
+
+	return renderNumberedLines(lines, keep)
+}
+
+func renderNumberedLines(lines []string, keep []bool) string {
+	b := strings.Builder{}
+	skipped := false
+	for i, line := range lines {
+		if keep != nil && !keep[i] {
+			skipped = true
+			continue
+		}
+		if skipped {
+			b.WriteString("...\n")
+			skipped = false
+		}
+		b.WriteString(fmt.Sprintf("%6d | %s\n", i+1, line))
+	}
+
+	if b.Len() == 0 {
+		return "No lines to display"
+	}
+
+	return strings.TrimRight(b.String(), "\n")
 }
