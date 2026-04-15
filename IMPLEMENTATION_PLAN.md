@@ -7,16 +7,16 @@
 - [x] Step 3: Build Git command runner abstraction
 - [x] Step 4: Implement main repository status indexer
 - [x] Step 5: Implement submodule discovery and indexing
-- [ ] Step 6: Build diff loading service (staged/unstaged)
-- [ ] Step 7: Add theme token system (single theme, extensible)
-- [ ] Step 8: Add config + file-based theme loading (`~/.gitriot`)
-- [ ] Step 9: Build base split-pane TUI layout
-- [ ] Step 10: Implement keyboard navigation + filters
-- [ ] Step 11: Add diff rendering color rules and polish
-- [ ] Step 12: Add async loading and responsiveness safeguards
-- [ ] Step 13: Add robust empty/error states
-- [ ] Step 14: Add CLI flags and startup wiring
-- [ ] Step 15: Add tests, docs, and release notes
+- [x] Step 6: Build diff loading service (staged/unstaged)
+- [x] Step 7: Add theme token system (single theme, extensible)
+- [x] Step 8: Add config + file-based theme loading (`~/.gitriot`)
+- [x] Step 9: Build base split-pane TUI layout
+- [x] Step 10: Implement keyboard navigation + filters
+- [x] Step 11: Add diff rendering color rules and polish
+- [x] Step 12: Add async loading and responsiveness safeguards
+- [x] Step 13: Add robust empty/error states
+- [x] Step 14: Add CLI flags and startup wiring
+- [x] Step 15: Add tests, docs, and release notes
 
 ## Build/Release Rule per Implementation Phase
 - Build `publish/gitriot.exe` at natural pause checkpoints ("stop for air" moments) instead of after every single step.
@@ -30,6 +30,12 @@
 - Step 3 completed with Git CLI runner abstraction in `internal/git/runner.go`.
 - Step 4 completed with porcelain status parsing in `internal/git/status.go`.
 - Step 5 completed with combined repo/submodule indexing in `internal/git/repository_indexer.go`.
+- Step 6 completed with staged/unstaged diff loader in `internal/git/diff_loader.go`.
+- Step 7 completed with theme tokens and defaults in `internal/theme/theme.go` and `internal/ui/styles.go`.
+- Step 8 completed with config and theme path resolution in `internal/config/config.go`.
+- Steps 9-13 completed with split-pane Bubble Tea UI, keyboard controls, async refresh, and warning-tolerant indexing in `internal/app/model.go`.
+- Step 14 completed with CLI startup wiring and flags in `cmd/gitriot/main.go`.
+- Step 15 completed with tests and docs in `internal/*/*_test.go`, `README.md`, and `RELEASE_NOTES.md`.
 
 ## Delivery Workflow
 1. Complete one step from the tracker.
