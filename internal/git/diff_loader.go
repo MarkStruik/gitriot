@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"gitriot/internal/model"
 )
@@ -29,6 +30,13 @@ type CommitDiffRequest struct {
 	SubmodulePath string
 	CommitHash    string
 	Path          string
+}
+
+type SinceDiffRequest struct {
+	RepoRoot      string
+	SubmodulePath string
+	Path          string
+	Since         time.Time
 }
 
 func NewDiffLoader(runner Runner) *DiffLoader {
@@ -115,6 +123,60 @@ func (d *DiffLoader) LoadCommitFile(ctx context.Context, req CommitDiffRequest) 
 	}
 
 	return out, nil
+}
+
+func (d *DiffLoader) LoadSince(ctx context.Context, req SinceDiffRequest) (model.DiffResult, error) {
+	workingDir := req.RepoRoot
+	if req.SubmodulePath != "" {
+		workingDir = joinRepoPath(req.RepoRoot, req.SubmodulePath)
+	}
+
+	baseHash, err := d.baseCommitBefore(ctx, workingDir, req.Since)
+	if err != nil {
+		return model.DiffResult{}, err
+	}
+
+	patch, err := d.runner.Run(ctx, workingDir, "diff", baseHash+"..HEAD", "--", req.Path)
+	if err != nil {
+		return model.DiffResult{}, err
+	}
+
+	res := model.DiffResult{
+		Patch: patch,
+		Empty: strings.TrimSpace(patch) == "",
+	}
+	if strings.Contains(patch, "Binary files") || strings.Contains(patch, "GIT binary patch") {
+		res.IsBinary = true
+	}
+	return res, nil
+}
+
+func (d *DiffLoader) LoadHeadFile(ctx context.Context, req SinceDiffRequest) (string, error) {
+	workingDir := req.RepoRoot
+	if req.SubmodulePath != "" {
+		workingDir = joinRepoPath(req.RepoRoot, req.SubmodulePath)
+	}
+	return d.runner.Run(ctx, workingDir, "show", "HEAD:"+req.Path)
+}
+
+func (d *DiffLoader) baseCommitBefore(ctx context.Context, workingDir string, since time.Time) (string, error) {
+	out, err := d.runner.Run(ctx, workingDir, "rev-list", "-n", "1", "--before="+since.UTC().Format(time.RFC3339), "HEAD")
+	if err != nil {
+		return "", err
+	}
+	hash := strings.TrimSpace(out)
+	if hash != "" {
+		return hash, nil
+	}
+	root, rootErr := d.runner.Run(ctx, workingDir, "rev-list", "--max-parents=0", "HEAD")
+	if rootErr != nil {
+		return "", rootErr
+	}
+	parts := strings.Fields(root)
+	if len(parts) == 0 {
+		return "", os.ErrNotExist
+	}
+	return parts[0], nil
 }
 
 func ParseChangedLineRangesFromPatch(patch string) []LineRange {

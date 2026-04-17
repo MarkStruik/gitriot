@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,12 +34,22 @@ type Option struct {
 	RepoPath     string
 	Theme        theme.FileTheme
 	RecentWindow time.Duration
+	SinceCommit  string
 }
+
+type leftPaneTab int
+
+const (
+	leftTabFiles leftPaneTab = iota
+	leftTabCommits
+)
 
 type Model struct {
 	repoPath string
+	rootName string
 	branch   string
 	styles   ui.Styles
+	colors   theme.Tokens
 	filters  Filters
 
 	runner *git.CLIRunner
@@ -48,19 +59,33 @@ type Model struct {
 	allItems      []model.ChangeItem
 	filteredItems []model.ChangeItem
 	recentCommits []model.RepoCommit
+	rootHistory   []model.RepoCommit
+	anchorIndex   int
+	anchorHash    string
 	recentFiles   []model.CommitFile
 	recentVisible []model.CommitFile
+	workingKeys   map[string]struct{}
 	recentWindow  time.Duration
+	sinceCommit   string
+	useSinceMode  bool
 	showRecent    bool
 	recentLoaded  bool
 	showHunksOnly bool
 	scopeBranches map[string]string
 	treeCollapsed map[string]bool
+	leftTab       leftPaneTab
+	commitCursor  int
+	commitOffset  int
+	scanStates    []scanState
+	scanActive    bool
+	scanSpinner   int
+	scanRequestID int
 
-	diff   viewport.Model
-	help   help.Model
-	search textinput.Model
-	focus  paneFocus
+	diff         viewport.Model
+	help         help.Model
+	search       textinput.Model
+	focus        paneFocus
+	showKeybinds bool
 
 	treeRows     []treeRow
 	selectedTree int
@@ -82,6 +107,7 @@ type Model struct {
 	lastFingerprint string
 	diffRawLines    []string
 	diffXOffset     int
+	diffChangeRows  []int
 }
 
 type treeRow struct {
@@ -90,6 +116,7 @@ type treeRow struct {
 	parentID   string
 	depth      int
 	kind       string
+	status     string
 	text       string
 	selectable bool
 	change     *model.ChangeItem
@@ -114,6 +141,7 @@ type treeBuildNode struct {
 type indexLoadedMsg struct {
 	requestID   int
 	branch      string
+	rootHistory []model.RepoCommit
 	result      git.IndexResult
 	scopeBranch map[string]string
 	fingerprint string
@@ -136,9 +164,39 @@ type fingerprintCheckedMsg struct {
 
 type recentLoadedMsg struct {
 	requestID   int
+	rootHistory []model.RepoCommit
 	result      git.RecentCommitResult
 	scopeBranch map[string]string
 	err         error
+}
+
+type submodulesDiscoveredMsg struct {
+	scanRequestID int
+	paths         []string
+	err           error
+}
+
+type submoduleIndexedMsg struct {
+	scanRequestID int
+	path          string
+	items         []model.ChangeItem
+	err           error
+}
+
+type commitSummaryLoadedMsg struct {
+	requestID int
+	hash      string
+	summary   model.CommitSummary
+	err       error
+}
+
+type spinnerTickMsg time.Time
+
+type scanState struct {
+	path   string
+	label  string
+	status string
+	err    string
 }
 
 type keyMap struct {
@@ -155,9 +213,14 @@ type keyMap struct {
 	ToggleNode      key.Binding
 	CollapseAll     key.Binding
 	ExpandAll       key.Binding
+	PrevAnchor      key.Binding
+	NextAnchor      key.Binding
 	ToggleHunksOnly key.Binding
+	NextChange      key.Binding
+	PrevChange      key.Binding
 	Search          key.Binding
 	ToggleRecent    key.Binding
+	ShowKeybinds    key.Binding
 	CloseSearch     key.Binding
 	Up              key.Binding
 	Down            key.Binding
@@ -191,8 +254,13 @@ var keys = keyMap{
 	ToggleNode:      key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "toggle")),
 	CollapseAll:     key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "collapse all")),
 	ExpandAll:       key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "expand all")),
+	PrevAnchor:      key.NewBinding(key.WithKeys("["), key.WithHelp("[", "prev tab")),
+	NextAnchor:      key.NewBinding(key.WithKeys("]"), key.WithHelp("]", "next tab")),
 	ToggleHunksOnly: key.NewBinding(key.WithKeys("h", "H"), key.WithHelp("h", "toggle hunks/full")),
-	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "toggle commits")),
+	NextChange:      key.NewBinding(key.WithKeys("}"), key.WithHelp("}", "next change")),
+	PrevChange:      key.NewBinding(key.WithKeys("{"), key.WithHelp("{", "prev change")),
+	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "current only")),
+	ShowKeybinds:    key.NewBinding(key.WithKeys("?", "f1"), key.WithHelp("?", "key help")),
 	Search:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
 	CloseSearch:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "close search")),
 	Up:              key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
@@ -216,7 +284,9 @@ func NewModel(opt Option) Model {
 
 	return Model{
 		repoPath:      filepath.Clean(opt.RepoPath),
+		rootName:      filepath.Base(filepath.Clean(opt.RepoPath)),
 		styles:        ui.NewStyles(opt.Theme),
+		colors:        opt.Theme.Colors,
 		filters:       DefaultFilters(),
 		runner:        runner,
 		index:         git.NewRepositoryIndexer(runner),
@@ -227,23 +297,57 @@ func NewModel(opt Option) Model {
 		focus:         focusChanges,
 		message:       "Loading repository status...",
 		recentWindow:  opt.RecentWindow,
+		sinceCommit:   strings.TrimSpace(opt.SinceCommit),
+		useSinceMode:  strings.TrimSpace(opt.SinceCommit) != "",
 		showHunksOnly: true,
+		anchorIndex:   0,
+		anchorHash:    strings.TrimSpace(opt.SinceCommit),
 		selectedTree:  -1,
 		scopeBranches: map[string]string{},
 		treeCollapsed: map[string]bool{},
+		leftTab:       leftTabFiles,
+		commitCursor:  0,
+		commitOffset:  0,
+		workingKeys:   map[string]struct{}{},
+		scanStates: []scanState{{
+			path:   "root",
+			label:  "root",
+			status: "loading",
+		}},
+		scanActive:    true,
+		scanSpinner:   0,
+		scanRequestID: 0,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.loadIndexCmd(), m.refreshTickCmd())
+	return tea.Batch(m.loadIndexCmd(), m.refreshTickCmd(), m.spinnerTickCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.showKeybinds {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			if key.Matches(keyMsg, keys.ShowKeybinds) || key.Matches(keyMsg, keys.CloseSearch) || key.Matches(keyMsg, keys.Quit) {
+				m.showKeybinds = false
+				if key.Matches(keyMsg, keys.Quit) {
+					return m, tea.Batch(tea.ClearScreen, tea.Quit)
+				}
+				return m, nil
+			}
+		}
+		return m, nil
+	}
+
 	if m.focus == focusSearch {
 		var cmd tea.Cmd
 		m.search, cmd = m.search.Update(msg)
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			switch {
+			case key.Matches(keyMsg, keys.ShowKeybinds):
+				m.search.Blur()
+				m.focus = focusChanges
+				m.showKeybinds = true
+				return m, nil
 			case key.Matches(keyMsg, keys.CloseSearch):
 				m.focus = focusChanges
 				m.search.Blur()
@@ -274,7 +378,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loading {
 			return m, m.refreshTickCmd()
 		}
+		if m.showRecent {
+			return m, m.refreshTickCmd()
+		}
 		return m, m.checkFingerprintCmd()
+	case spinnerTickMsg:
+		if m.scanActive {
+			m.scanSpinner = (m.scanSpinner + 1) % len(scanSpinnerFrames)
+		}
+		return m, m.spinnerTickCmd()
 	case fingerprintCheckedMsg:
 		if msg.err != nil {
 			m.warn = append(m.warn, "background refresh failed: "+msg.err.Error())
@@ -291,21 +403,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.loading = false
 		if msg.err != nil {
+			m.markScanStatus("root", "error", msg.err.Error())
+			m.scanActive = false
 			m.message = "Indexing failed: " + msg.err.Error()
 			return m, nil
 		}
 
 		m.branch = msg.branch
+		if len(msg.rootHistory) > 0 {
+			m.rootHistory = msg.rootHistory
+			m.anchorIndex = resolveAnchorIndex(m.rootHistory, m.anchorHash)
+			m.anchorHash = m.rootHistory[m.anchorIndex].Hash
+			m.commitCursor = m.anchorIndex
+			m.ensureCommitCursorInBounds()
+		}
 		m.scopeBranches = copyStringMap(msg.scopeBranch)
 		m.warn = msg.result.Warnings
 		m.lastFingerprint = msg.fingerprint
 		m.allItems = msg.result.Items
-		if len(m.allItems) == 0 && m.recentWindow > 0 {
+		if m.useSinceMode {
 			m.showRecent = true
 		}
 		if !m.showRecent {
 			m.recentVisible = nil
 		}
+		m.markScanRootDone()
+		discoverCmd := m.discoverSubmodulesCmd(m.scanRequestID)
 		m.applyCurrentList()
 		if m.showRecent {
 			m.setDiffText(m.renderRecentSummary())
@@ -313,20 +436,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.recentLoaded {
 				m.message = fmt.Sprintf("Loaded %d files from recent commits", len(m.recentVisible))
 				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
-					return m, tea.Batch(cmd, m.refreshTickCmd())
+					return m, tea.Batch(cmd, discoverCmd, m.refreshTickCmd())
 				}
 			} else {
-				m.message = "Loading recent commits..."
-				return m, tea.Batch(m.loadRecentCmd(), m.refreshTickCmd())
+				if m.effectiveSinceMode() {
+					m.message = "Loading files since selected commit..."
+				} else {
+					m.message = "Loading recent commits..."
+				}
+				return m, tea.Batch(m.loadRecentCmd(), discoverCmd, m.refreshTickCmd())
 			}
 		} else {
 			m.activeRef = ""
-			m.message = fmt.Sprintf("Loaded %d changes", len(m.allItems))
+			m.message = fmt.Sprintf("Loaded %d root changes (scanning submodules...)", len(m.allItems))
 			if cmd := m.autoLoadSelectedDiff(); cmd != nil {
-				return m, tea.Batch(cmd, m.refreshTickCmd())
+				return m, tea.Batch(cmd, discoverCmd, m.refreshTickCmd())
 			}
 		}
-		return m, m.refreshTickCmd()
+		return m, tea.Batch(discoverCmd, m.refreshTickCmd())
 	case recentLoadedMsg:
 		if msg.requestID != m.requestID {
 			return m, nil
@@ -337,6 +464,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.recentLoaded = true
+		if len(msg.rootHistory) > 0 {
+			m.rootHistory = msg.rootHistory
+			m.anchorIndex = resolveAnchorIndex(m.rootHistory, msg.result.Anchor.Hash)
+			m.anchorHash = msg.result.Anchor.Hash
+			m.commitCursor = m.anchorIndex
+			m.ensureCommitCursorInBounds()
+		}
 		m.recentCommits = msg.result.Commits
 		m.recentFiles = msg.result.Files
 		if len(msg.scopeBranch) > 0 {
@@ -344,11 +478,83 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.warn = append(m.warn, msg.result.Warnings...)
 		m.applyCurrentList()
-		m.setDiffText(m.renderRecentSummary())
+		if m.leftTab == leftTabCommits {
+			m.ensureCommitCursorInBounds()
+			if cmd := m.loadSelectedCommitSummaryCmd(); cmd != nil {
+				return m, cmd
+			}
+		} else {
+			m.setDiffText(m.renderRecentSummary())
+		}
 		m.message = fmt.Sprintf("Loaded %d files from recent commits", len(m.recentVisible))
 		if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 			return m, cmd
 		}
+		return m, nil
+	case submodulesDiscoveredMsg:
+		if msg.scanRequestID != m.scanRequestID {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.warn = append(m.warn, "submodule discovery unavailable: "+msg.err.Error())
+			m.scanActive = false
+			return m, nil
+		}
+		if len(msg.paths) == 0 {
+			m.scanActive = false
+			if !m.showRecent {
+				m.message = fmt.Sprintf("Loaded %d changes", len(m.allItems))
+			}
+			return m, nil
+		}
+		m.setSubmoduleScanPaths(msg.paths)
+		cmds := make([]tea.Cmd, 0, len(msg.paths))
+		for _, path := range msg.paths {
+			m.markScanStatus(path, "loading", "")
+			cmds = append(cmds, m.indexSubmoduleCmd(msg.scanRequestID, path))
+		}
+		m.message = fmt.Sprintf("Scanning %d submodules...", len(msg.paths))
+		return m, tea.Batch(cmds...)
+	case submoduleIndexedMsg:
+		if msg.scanRequestID != m.scanRequestID {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.warn = append(m.warn, fmt.Sprintf("submodule %q %v", msg.path, msg.err))
+			m.markScanStatus(msg.path, "error", msg.err.Error())
+		} else {
+			m.markScanStatus(msg.path, "done", "")
+			if len(msg.items) > 0 {
+				previous := m.currentSelectionID()
+				m.allItems = append(m.allItems, msg.items...)
+				m.applyCurrentListWithPreserve(previous)
+			}
+		}
+		if m.scanAllDone() {
+			m.scanActive = false
+			if !m.showRecent {
+				m.message = fmt.Sprintf("Loaded %d total changes", len(m.allItems))
+			}
+			return m, nil
+		}
+		done, total := m.scanProgressCounts()
+		m.message = fmt.Sprintf("Scanning submodules... (%d/%d)", done, total)
+		return m, nil
+	case commitSummaryLoadedMsg:
+		if msg.requestID != m.requestID {
+			return m, nil
+		}
+		if selected := m.selectedRootCommit(); selected != nil && selected.Hash != msg.hash {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.setDiffText("Unable to load commit details:\n" + msg.err.Error())
+			m.message = "Commit detail load failed"
+			return m, nil
+		}
+		m.activeRef = "commit " + shortHash(msg.hash)
+		m.setDiffText(renderCommitSummary(msg.summary))
+		m.message = "Commit details loaded"
 		return m, nil
 	case diffLoadedMsg:
 		if msg.requestID != m.requestID {
@@ -363,6 +569,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.diffRawLines = msg.lines
 		m.diffXOffset = 0
+		m.diffChangeRows = collectChangeRows(msg.lines)
 		m.refreshDiffViewport()
 		if msg.isBinary {
 			m.message = "Binary diff loaded"
@@ -374,6 +581,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		switch {
+		case key.Matches(msg, keys.ShowKeybinds):
+			m.showKeybinds = true
+			return m, nil
 		case key.Matches(msg, keys.Quit):
 			return m, tea.Batch(tea.ClearScreen, tea.Quit)
 		case key.Matches(msg, keys.FocusSwitch):
@@ -384,34 +594,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.search.Focus()
 			return m, textinput.Blink
 		case key.Matches(msg, keys.ToggleRecent):
-			if m.recentWindow <= 0 {
-				m.message = "Recent commit view disabled; use --recent-window"
+			m.showRecent = false
+			m.leftTab = leftTabFiles
+			m.applyCurrentList()
+			m.activeRef = ""
+			m.message = "Current changes only"
+			if cmd := m.autoLoadSelectedDiff(); cmd != nil {
+				return m, tea.Batch(cmd, m.loadIndexCmd())
+			}
+			return m, m.loadIndexCmd()
+		case key.Matches(msg, keys.PrevAnchor):
+			if m.focus != focusChanges {
 				return m, nil
 			}
-			m.showRecent = !m.showRecent
-			if m.showRecent {
-				m.applyCurrentList()
-				m.setDiffText(m.renderRecentSummary())
-				m.activeRef = "recent snapshot"
-				if !m.recentLoaded {
-					m.message = "Loading recent commits..."
-					return m, m.loadRecentCmd()
-				}
-				m.message = fmt.Sprintf("Showing %d recent commit files", len(m.recentVisible))
-				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
-					return m, cmd
-				}
-			} else {
-				m.applyCurrentList()
-				m.activeRef = ""
-				m.message = "Showing diff view"
-				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
-					return m, cmd
-				}
+			m.prevLeftTab()
+			if cmd := m.previewCmdForActiveTab(); cmd != nil {
+				return m, cmd
+			}
+			return m, nil
+		case key.Matches(msg, keys.NextAnchor):
+			if m.focus != focusChanges {
+				return m, nil
+			}
+			m.nextLeftTab()
+			if cmd := m.previewCmdForActiveTab(); cmd != nil {
+				return m, cmd
 			}
 			return m, nil
 		case key.Matches(msg, keys.CollapseNode):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					return m, nil
+				}
 				if ok, preserve := m.collapseTreeAtSelection(); ok {
 					m.applyCurrentListWithPreserve(preserve)
 					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
@@ -426,6 +640,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, keys.ExpandNode):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					return m, nil
+				}
 				if ok, preserve := m.expandTreeAtSelection(); ok {
 					m.applyCurrentListWithPreserve(preserve)
 					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
@@ -440,6 +657,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, keys.ToggleNode):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					return m, nil
+				}
 				if ok, preserve := m.toggleTreeAtSelection(); ok {
 					m.applyCurrentListWithPreserve(preserve)
 					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
@@ -450,6 +670,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, keys.CollapseAll):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					return m, nil
+				}
 				if m.collapseAllTreeNodes() {
 					m.applyCurrentListWithPreserve("")
 					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
@@ -460,6 +683,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, keys.ExpandAll):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					return m, nil
+				}
 				if m.expandAllTreeNodes() {
 					m.applyCurrentListWithPreserve(m.currentSelectionID())
 					if cmd := m.autoLoadSelectedDiff(); cmd != nil {
@@ -484,6 +710,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 			return m, nil
+		case key.Matches(msg, keys.NextChange):
+			if m.focus == focusDiff {
+				if m.jumpToChange(true) {
+					m.message = "Jumped to next change"
+				} else {
+					m.message = "No more changes"
+				}
+				return m, nil
+			}
+		case key.Matches(msg, keys.PrevChange):
+			if m.focus == focusDiff {
+				if m.jumpToChange(false) {
+					m.message = "Jumped to previous change"
+				} else {
+					m.message = "No previous changes"
+				}
+				return m, nil
+			}
 		case key.Matches(msg, keys.Refresh):
 			return m, m.loadIndexCmd()
 		case key.Matches(msg, keys.FilterStaged):
@@ -503,6 +747,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.applyCurrentList()
 			return m, nil
 		case key.Matches(msg, keys.Open):
+			if m.leftTab == leftTabCommits {
+				commit := m.selectedRootCommit()
+				if commit == nil {
+					return m, nil
+				}
+				m.anchorHash = commit.Hash
+				m.anchorIndex = m.commitCursor
+				m.useSinceMode = true
+				m.showRecent = true
+				m.recentLoaded = false
+				m.leftTab = leftTabFiles
+				m.message = "Loading files since selected commit..."
+				m.setDiffText("Loading commit range...")
+				return m, m.loadRecentCmd()
+			}
 			if m.selectedTree >= 0 && m.selectedTree < len(m.treeRows) {
 				row := m.treeRows[m.selectedTree]
 				if row.kind == treeKindScope || row.kind == treeKindDir {
@@ -512,20 +771,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
-			if m.showRecent {
+			item := m.selectedItem()
+			if item == nil {
 				file := m.selectedRecentFile()
 				if file == nil {
 					return m, nil
 				}
 				return m, m.loadCommitDiffCmd(*file)
 			}
-			item := m.selectedItem()
-			if item == nil {
-				return m, nil
+			if m.showRecent {
+				if _, ok := m.workingKeys[item.ScopeLabel()+"|"+item.Path]; !ok {
+					file := m.selectedRecentFile()
+					if file != nil {
+						return m, m.loadCommitDiffCmd(*file)
+					}
+				}
 			}
 			return m, m.loadDiffCmd(*item)
 		case key.Matches(msg, keys.Up):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					m.moveCommitSelection(-1)
+					if cmd := m.loadSelectedCommitSummaryCmd(); cmd != nil {
+						return m, cmd
+					}
+					return m, nil
+				}
 				m.moveSelection(-1)
 				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 					return m, cmd
@@ -534,6 +805,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, keys.Down):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					m.moveCommitSelection(1)
+					if cmd := m.loadSelectedCommitSummaryCmd(); cmd != nil {
+						return m, cmd
+					}
+					return m, nil
+				}
 				m.moveSelection(1)
 				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 					return m, cmd
@@ -542,6 +820,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, keys.PageUp):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					m.pageCommitSelection(-1)
+					if cmd := m.loadSelectedCommitSummaryCmd(); cmd != nil {
+						return m, cmd
+					}
+					return m, nil
+				}
 				m.pageSelection(-1)
 				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 					return m, cmd
@@ -550,6 +835,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, keys.PageDown):
 			if m.focus == focusChanges {
+				if m.leftTab == leftTabCommits {
+					m.pageCommitSelection(1)
+					if cmd := m.loadSelectedCommitSummaryCmd(); cmd != nil {
+						return m, cmd
+					}
+					return m, nil
+				}
 				m.pageSelection(1)
 				if cmd := m.autoLoadSelectedDiff(); cmd != nil {
 					return m, cmd
@@ -576,7 +868,7 @@ func (m Model) View() string {
 	top := m.renderTopBar()
 	left := m.renderChangesPane(leftWidth, paneHeight)
 	right := m.renderDiffPane(rightWidth, paneHeight)
-	sep := renderVerticalSep(paneHeight)
+	sep := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.LineSep)).Render(renderVerticalSep(paneHeight))
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right)
 	bottom := m.renderBottomBar()
 
@@ -584,6 +876,9 @@ func (m Model) View() string {
 	if m.focus == focusSearch {
 		search := m.styles.SearchPrompt.Render("Search: ") + m.search.View()
 		base = lipgloss.JoinVertical(lipgloss.Left, base, search)
+	}
+	if m.showKeybinds {
+		base = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderKeybindModal())
 	}
 
 	return m.styles.Frame.Width(m.width).Height(m.height).MaxWidth(m.width).MaxHeight(m.height).Render(base)
@@ -601,7 +896,11 @@ func (m *Model) resize() {
 	m.leftHeight = maxInt(contentHeight, 1)
 	m.diff.Width = rightWidth - 4
 	m.diff.Height = contentHeight
-	m.ensureSelectionVisible()
+	if m.leftTab == leftTabCommits {
+		m.ensureCommitCursorInBounds()
+	} else {
+		m.ensureSelectionVisible()
+	}
 	m.refreshDiffViewport()
 }
 
@@ -614,15 +913,12 @@ func (m *Model) rotateFocus() {
 }
 
 func (m *Model) renderTopBar() string {
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#8ec0ff")).Render("GitRiot")
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.colors.Accent)).Render("GitRiot")
 	return m.styles.Status.Width(m.width).Render(title)
 }
 
 func (m *Model) renderChangesPane(width int, height int) string {
 	titleText := "Changes"
-	if m.showRecent {
-		titleText = "Commit Files"
-	}
 	titlePrefix := "  "
 	if m.focus == focusChanges {
 		titlePrefix = "* "
@@ -632,30 +928,41 @@ func (m *Model) renderChangesPane(width int, height int) string {
 		title = title + " " + m.styles.Muted.Render("(loading)")
 	}
 
+	tabLine := m.renderRecentTabs()
 	body := m.renderTreePanel()
-	if m.showRecent && len(m.recentVisible) == 0 {
-		body = m.styles.Muted.Render("No files found in recent commits")
-	} else if !m.showRecent && len(m.filteredItems) == 0 {
+	if m.leftTab == leftTabCommits {
+		body = m.renderCommitPanel()
+	} else if len(m.treeRows) == 0 {
 		body = m.styles.Muted.Render("No changes match filters")
 	}
-
-	panel := lipgloss.JoinVertical(lipgloss.Left, title, body)
-	bg := lipgloss.Color("#22283a")
+	panelParts := []string{title}
+	panelParts = append(panelParts, tabLine)
+	panelParts = append(panelParts, body)
+	panel := lipgloss.JoinVertical(lipgloss.Left, panelParts...)
+	bg := lipgloss.Color(m.colors.PanelLeftBg)
 	if m.focus == focusChanges {
-		bg = lipgloss.Color("#2a3147")
+		bg = lipgloss.Color(m.colors.PanelActiveBg)
 	}
 	return lipgloss.NewStyle().Background(bg).Width(width).Height(maxInt(height, 3)).Render(panel)
 }
 
 func (m *Model) renderDiffPane(width int, height int) string {
 	titleText := "Diff"
-	if m.showRecent {
+	if m.leftTab == leftTabCommits {
+		titleText = "Commit Preview"
+	} else if m.showRecent {
 		titleText = "Commit Details"
+	}
+	if m.showRecent || m.leftTab == leftTabCommits {
+		if len(m.rootHistory) > 0 && m.anchorIndex >= 0 && m.anchorIndex < len(m.rootHistory) {
+			anchor := m.rootHistory[m.anchorIndex]
+			titleText += " @" + shortHash(anchor.Hash)
+		}
 	}
 	if m.activeRef != "" {
 		titleText = titleText + " - " + truncateText(m.activeRef, maxInt(m.width/2, 24))
 	}
-	if m.currentSelectionIsFile() {
+	if m.currentSelectionIsFile() && m.leftTab != leftTabCommits {
 		if m.showHunksOnly {
 			titleText += " [Hunks+5]"
 		} else {
@@ -670,9 +977,9 @@ func (m *Model) renderDiffPane(width int, height int) string {
 
 	body := m.diff.View()
 	panel := lipgloss.JoinVertical(lipgloss.Left, title, body)
-	bg := lipgloss.Color("#2f354b")
+	bg := lipgloss.Color(m.colors.PanelRightBg)
 	if m.focus == focusDiff {
-		bg = lipgloss.Color("#353d55")
+		bg = lipgloss.Color(m.colors.PanelActiveBg)
 	}
 	return lipgloss.NewStyle().Background(bg).Width(width).Height(maxInt(height, 3)).Render(panel)
 }
@@ -682,36 +989,64 @@ func (m *Model) renderBottomBar() string {
 	if msg == "" {
 		msg = "Ready"
 	}
-	line := m.styles.Muted.Render(msg)
-	treeStyle := m.styles.Muted
-	diffStyle := m.styles.Muted
-	if m.focus == focusChanges {
-		treeStyle = m.styles.Title
-	} else if m.focus == focusDiff {
-		diffStyle = m.styles.Title
-	}
+	line := truncateText(msg, maxInt(m.width-2, 10))
+	line = m.styles.Muted.Render(line)
 
-	treeSeg := treeStyle.Render("󰙅 TREE  ←/h collapse  →/l expand  ␠ toggle  x/X all")
-	diffSeg := diffStyle.Render("󰈙 DIFF  h hunks/full")
-	globalSeg := m.styles.Muted.Render("󰌌 GLOBAL  tab pane  c commits  / search  r refresh  q quit")
-	if m.width < 120 {
-		treeSeg = treeStyle.Render("󰙅 ←/h →/l ␠ x/X")
-		diffSeg = diffStyle.Render("󰈙 h")
-		globalSeg = m.styles.Muted.Render("tab c / r q")
+	active := m.activeKeybindSummary()
+	active = truncateText(active+"  |  ? help", maxInt(m.width-2, 10))
+	activeLine := m.styles.Title.Render(active)
+
+	return lipgloss.JoinVertical(lipgloss.Left, line, activeLine)
+}
+
+func (m *Model) activeKeybindSummary() string {
+	if m.focus == focusSearch {
+		return "SEARCH  type filter  enter apply  esc close"
 	}
-	if m.width < 92 {
-		treeSeg = treeStyle.Render("←/h →/l ␠")
-		diffSeg = diffStyle.Render("h")
-		globalSeg = m.styles.Muted.Render("tab c / q")
+	if m.focus == focusDiff {
+		return "DIFF  h hunks/full  { prev change  } next change  ←/→ pan"
 	}
-	helpLine := treeSeg + m.styles.Muted.Render("   •   ") + diffSeg + m.styles.Muted.Render("   •   ") + globalSeg
-	helpLine = truncateText(helpLine, maxInt(m.width-2, 10))
-	return lipgloss.JoinVertical(lipgloss.Left, line, helpLine)
+	if m.leftTab == leftTabCommits {
+		return "COMMITS  ↑/↓ move  enter apply+switch  [ ] tabs"
+	}
+	if m.showRecent {
+		return "FILES  ↑/↓ move  enter open  ← collapse  →/l expand  x/X all  c current only"
+	}
+	return "FILES  ↑/↓ move  enter open  ← collapse  →/l expand  x/X all  c current only"
+}
+
+func (m *Model) renderKeybindModal() string {
+	content := strings.Join([]string{
+		"Keybindings",
+		"",
+		"Global: q quit | tab switch pane | r refresh | / search | c current only | ? help",
+		"Tree:   ↑/↓ move | enter toggle folder | ← collapse | →/l expand | space toggle | x/X all",
+		"Tabs:   [ prev tab | ] next tab | Commits tab: enter apply anchor and switch to Files",
+		"Mode:   c return to current-only view (live updates enabled)",
+		"Diff:   h hunks/full | { prev change | } next change | ←/→ pan horizontally",
+		"Search: type query | enter apply | esc close",
+		"",
+		"Press ? or esc to close",
+	}, "\n")
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(m.colors.Accent)).
+		Background(lipgloss.Color(m.colors.PanelRightBg)).
+		Foreground(lipgloss.Color(m.colors.Fg)).
+		Padding(1, 2).
+		Width(maxInt(minInt(m.width-8, 120), 40)).
+		Render(content)
+	return box
 }
 
 func (m *Model) loadIndexCmd() tea.Cmd {
 	m.loading = true
 	m.requestID++
+	m.scanRequestID++
+	m.scanActive = true
+	m.scanSpinner = 0
+	m.scanStates = []scanState{{path: "root", label: m.rootScanLabel(), status: "loading"}}
 	m.recentLoaded = false
 	requestID := m.requestID
 	repoPath := m.repoPath
@@ -722,29 +1057,41 @@ func (m *Model) loadIndexCmd() tea.Cmd {
 
 		branch, branchErr := git.CurrentBranch(ctx, m.runner, repoPath)
 		fingerprint, fingerprintErr := git.WorkingTreeFingerprint(ctx, m.runner, repoPath)
-		result, err := m.index.IndexAll(ctx, repoPath)
+		rootHistory, historyErr := git.RootCommitHistory(ctx, m.runner, repoPath, 120)
+		rootItems, err := m.index.IndexRoot(ctx, repoPath)
+		result := git.IndexResult{Items: rootItems}
 		scopeBranches := map[string]string{"root": valueOr(branch, "?")}
-		submodules := collectSubmodulePathsFromChanges(result.Items)
-		for _, submodule := range submodules {
-			subDir := gitSubmoduleDir(repoPath, submodule)
-			subBranch, subErr := git.CurrentBranch(ctx, m.runner, subDir)
-			if subErr != nil {
-				scopeBranches[submodule] = "?"
-				if err == nil {
-					result.Warnings = append(result.Warnings, fmt.Sprintf("branch unavailable for %s: %v", submodule, subErr))
-				}
-				continue
-			}
-			scopeBranches[submodule] = valueOr(subBranch, "?")
-		}
 		if branchErr != nil && err == nil {
 			result.Warnings = append(result.Warnings, branchErr.Error())
 		}
 		if fingerprintErr != nil && err == nil {
 			result.Warnings = append(result.Warnings, "fingerprint unavailable: "+fingerprintErr.Error())
 		}
+		if historyErr != nil && err == nil {
+			result.Warnings = append(result.Warnings, "commit history unavailable: "+historyErr.Error())
+		}
 
-		return indexLoadedMsg{requestID: requestID, branch: branch, result: result, scopeBranch: scopeBranches, fingerprint: fingerprint, err: err}
+		return indexLoadedMsg{requestID: requestID, branch: branch, rootHistory: rootHistory, result: result, scopeBranch: scopeBranches, fingerprint: fingerprint, err: err}
+	}
+}
+
+func (m *Model) discoverSubmodulesCmd(scanRequestID int) tea.Cmd {
+	repoPath := m.repoPath
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		paths, err := m.index.DiscoverSubmodules(ctx, repoPath)
+		return submodulesDiscoveredMsg{scanRequestID: scanRequestID, paths: paths, err: err}
+	}
+}
+
+func (m *Model) indexSubmoduleCmd(scanRequestID int, path string) tea.Cmd {
+	repoPath := m.repoPath
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		items, err := m.index.IndexSubmodule(ctx, repoPath, path)
+		return submoduleIndexedMsg{scanRequestID: scanRequestID, path: path, items: items, err: err}
 	}
 }
 
@@ -783,7 +1130,7 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 
 		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 		decor := git.ParseLineDecorationsFromPatch(result.Patch)
-		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(req.Path, full, ranges, decor, showHunksOnly, 5)
+		view := "Path: " + activeRef + "\n\n" + m.renderFileWithHunks(req.Path, full, ranges, decor, showHunksOnly, 5)
 		return diffLoadedMsg{requestID: requestID, lines: strings.Split(view, "\n"), empty: result.Empty}
 	}
 }
@@ -791,6 +1138,12 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 func (m *Model) refreshTickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return refreshTickMsg(t)
+	})
+}
+
+func (m *Model) spinnerTickCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg(t)
 	})
 }
 
@@ -806,16 +1159,36 @@ func (m *Model) checkFingerprintCmd() tea.Cmd {
 }
 
 func (m *Model) loadRecentCmd() tea.Cmd {
-	if m.recentWindow <= 0 {
-		return nil
-	}
 	requestID := m.requestID
 	repoPath := m.repoPath
+	anchorHash := m.anchorHash
+	sinceMode := m.effectiveSinceMode()
+	currentHistory := append([]model.RepoCommit(nil), m.rootHistory...)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
+		history := currentHistory
+		if len(history) == 0 {
+			loadedHistory, historyErr := git.RootCommitHistory(ctx, m.runner, repoPath, 120)
+			if historyErr != nil {
+				return recentLoadedMsg{requestID: requestID, err: historyErr}
+			}
+			history = loadedHistory
+		}
+		if len(history) == 0 {
+			return recentLoadedMsg{requestID: requestID, err: fmt.Errorf("no root commits found")}
+		}
+		if strings.TrimSpace(anchorHash) == "" {
+			anchorHash = history[0].Hash
+		}
 
-		res, err := git.CollectRecentCommits(ctx, m.runner, repoPath, m.recentWindow)
+		var res git.RecentCommitResult
+		var err error
+		if sinceMode {
+			res, err = git.CollectCommitsSince(ctx, m.runner, repoPath, anchorHash)
+		} else {
+			res, err = git.CollectRecentCommitsAt(ctx, m.runner, repoPath, m.recentWindow, anchorHash)
+		}
 		scopeBranches := copyStringMap(m.scopeBranches)
 		submodules := collectSubmodulePathsFromCommitFiles(res.Files)
 		for _, submodule := range submodules {
@@ -830,7 +1203,7 @@ func (m *Model) loadRecentCmd() tea.Cmd {
 			}
 			scopeBranches[submodule] = valueOr(subBranch, "?")
 		}
-		return recentLoadedMsg{requestID: requestID, result: res, scopeBranch: scopeBranches, err: err}
+		return recentLoadedMsg{requestID: requestID, rootHistory: history, result: res, scopeBranch: scopeBranches, err: err}
 	}
 }
 
@@ -839,8 +1212,12 @@ func (m *Model) applyCurrentList() {
 }
 
 func (m *Model) applyCurrentListWithPreserve(previousSelectionID string) {
+	if m.leftTab == leftTabCommits {
+		m.applyFiltersToList(previousSelectionID)
+		return
+	}
 	if m.showRecent {
-		m.applyRecentFilesToList(previousSelectionID)
+		m.applyMergedFilesToList(previousSelectionID)
 		return
 	}
 	m.applyFiltersToList(previousSelectionID)
@@ -848,13 +1225,21 @@ func (m *Model) applyCurrentListWithPreserve(previousSelectionID string) {
 
 func (m *Model) applyFiltersToList(previousSelectionID string) {
 	m.filteredItems = ApplyFilters(m.allItems, m.filters)
-	m.treeRows = buildChangeTreeRows(m.filteredItems, m.scopeBranches, m.treeCollapsed)
+	m.treeRows = buildChangeTreeRows(m.filteredItems, m.scopeBranches, m.treeCollapsed, m.rootName)
 	m.restoreSelection(previousSelectionID)
 }
 
-func (m *Model) applyRecentFilesToList(previousSelectionID string) {
+func (m *Model) applyMergedFilesToList(previousSelectionID string) {
+	m.filteredItems = ApplyFilters(m.allItems, m.filters)
+	m.workingKeys = make(map[string]struct{}, len(m.filteredItems))
+	for _, item := range m.filteredItems {
+		key := item.ScopeLabel() + "|" + item.Path
+		m.workingKeys[key] = struct{}{}
+	}
+
 	query := strings.ToLower(strings.TrimSpace(m.filters.Query))
 	filtered := make([]model.CommitFile, 0, len(m.recentFiles))
+	fileMap := make(map[string]model.CommitFile, len(m.recentFiles))
 	for _, file := range m.recentFiles {
 		if !m.filters.ShowSubmodule && !file.IsRoot {
 			continue
@@ -866,9 +1251,34 @@ func (m *Model) applyRecentFilesToList(previousSelectionID string) {
 			}
 		}
 		filtered = append(filtered, file)
+		key := file.Scope + "|" + file.Path
+		if _, ok := fileMap[key]; !ok {
+			fileMap[key] = file
+		}
 	}
 	m.recentVisible = filtered
-	m.treeRows = buildRecentTreeRows(filtered, m.scopeBranches, m.treeCollapsed)
+
+	combined := make([]model.ChangeItem, 0, len(m.filteredItems)+len(filtered))
+	combined = append(combined, m.filteredItems...)
+	for _, file := range filtered {
+		key := file.Scope + "|" + file.Path
+		if _, ok := m.workingKeys[key]; ok {
+			continue
+		}
+		combined = append(combined, commitFileToChangeItem(file, m.repoPath))
+	}
+
+	m.treeRows = buildChangeTreeRows(combined, m.scopeBranches, m.treeCollapsed, m.rootName)
+	for i := range m.treeRows {
+		if m.treeRows[i].kind != treeKindFile || m.treeRows[i].change == nil {
+			continue
+		}
+		key := m.treeRows[i].change.ScopeLabel() + "|" + m.treeRows[i].change.Path
+		if file, ok := fileMap[key]; ok {
+			fileCopy := file
+			m.treeRows[i].commitFile = &fileCopy
+		}
+	}
 	m.restoreSelection(previousSelectionID)
 }
 
@@ -944,6 +1354,14 @@ func maxInt(a int, b int) int {
 	return b
 }
 
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+
+	return b
+}
+
 func valueOr(v string, fallback string) string {
 	if strings.TrimSpace(v) == "" {
 		return fallback
@@ -953,16 +1371,19 @@ func valueOr(v string, fallback string) string {
 }
 
 func (m *Model) renderRecentSummary() string {
-	if m.recentWindow <= 0 {
-		return m.styles.Muted.Render("Recent commit view is disabled. Start with --recent-window (example: --recent-window 2h).")
-	}
-
 	if len(m.recentCommits) == 0 {
+		if m.effectiveSinceMode() {
+			return m.styles.Muted.Render("No commits found from the selected anchor timestamp to now.")
+		}
 		return m.styles.Muted.Render("No commits found in the selected window.")
 	}
 
 	b := strings.Builder{}
-	b.WriteString(m.styles.Muted.Render("Recent commit snapshot. Select a file on the left to auto-load its commit diff."))
+	if m.effectiveSinceMode() {
+		b.WriteString(m.styles.Muted.Render("Commit range snapshot from selected anchor timestamp to now. Select a file on the left to auto-load its commit diff."))
+	} else {
+		b.WriteString(m.styles.Muted.Render("Recent commit snapshot. Select a file on the left to auto-load its commit diff."))
+	}
 	b.WriteByte('\n')
 	b.WriteByte('\n')
 
@@ -984,6 +1405,54 @@ func (m *Model) renderRecentSummary() string {
 }
 
 func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
+	if m.effectiveSinceMode() {
+		anchorWhen, ok := m.currentAnchorTime()
+		if !ok {
+			m.setDiffText("Unable to resolve selected anchor timestamp")
+			return nil
+		}
+		m.requestID++
+		requestID := m.requestID
+		scope := file.Scope
+		if file.IsRoot {
+			scope = "root"
+		}
+		activeRef := fmt.Sprintf("%s/%s since %s", scope, file.Path, anchorWhen.Local().Format(time.RFC3339))
+		m.activeRef = activeRef
+		req := git.SinceDiffRequest{
+			RepoRoot:      m.repoPath,
+			SubmodulePath: file.SubmodulePath,
+			Path:          file.Path,
+			Since:         anchorWhen,
+		}
+
+		m.setDiffText("Loading since-anchor diff...")
+		showHunksOnly := m.showHunksOnly
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+
+			result, err := m.diffs.LoadSince(ctx, req)
+			if err != nil {
+				return diffLoadedMsg{requestID: requestID, err: err}
+			}
+			if result.IsBinary {
+				return diffLoadedMsg{requestID: requestID, lines: []string{"Binary file diff"}, isBinary: true, empty: result.Empty}
+			}
+
+			full, fullErr := m.diffs.LoadHeadFile(ctx, req)
+			if fullErr != nil {
+				fallback := "Path: " + activeRef + "\n\n" + m.renderDiff(result)
+				return diffLoadedMsg{requestID: requestID, lines: strings.Split(fallback, "\n"), empty: result.Empty}
+			}
+
+			ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
+			decor := git.ParseLineDecorationsFromPatch(result.Patch)
+			view := "Path: " + activeRef + "\n\n" + m.renderFileWithHunks(file.Path, full, ranges, decor, showHunksOnly, 5)
+			return diffLoadedMsg{requestID: requestID, lines: strings.Split(view, "\n"), empty: result.Empty}
+		}
+	}
+
 	m.requestID++
 	requestID := m.requestID
 	scope := file.Scope
@@ -1021,12 +1490,29 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 
 		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 		decor := git.ParseLineDecorationsFromPatch(result.Patch)
-		view := "Path: " + activeRef + "\n\n" + renderFileWithHunks(file.Path, full, ranges, decor, showHunksOnly, 5)
+		view := "Path: " + activeRef + "\n\n" + m.renderFileWithHunks(file.Path, full, ranges, decor, showHunksOnly, 5)
 		return diffLoadedMsg{requestID: requestID, lines: strings.Split(view, "\n"), empty: result.Empty}
 	}
 }
 
+func (m *Model) currentAnchorTime() (time.Time, bool) {
+	if len(m.rootHistory) == 0 {
+		return time.Time{}, false
+	}
+	if m.anchorIndex < 0 || m.anchorIndex >= len(m.rootHistory) {
+		return time.Time{}, false
+	}
+	return m.rootHistory[m.anchorIndex].When, true
+}
+
+func (m *Model) effectiveSinceMode() bool {
+	return m.useSinceMode || m.recentWindow <= 0
+}
+
 func (m *Model) autoLoadSelectedDiff() tea.Cmd {
+	if m.leftTab == leftTabCommits {
+		return nil
+	}
 	selectionID := m.currentSelectionID()
 	if selectionID == "" {
 		return nil
@@ -1044,17 +1530,21 @@ func (m *Model) autoLoadSelectedDiff() tea.Cmd {
 		return nil
 	}
 
-	if m.showRecent {
+	item := m.selectedItem()
+	if item == nil {
 		file := m.selectedRecentFile()
 		if file == nil {
 			return nil
 		}
 		return m.loadCommitDiffCmd(*file)
 	}
-
-	item := m.selectedItem()
-	if item == nil {
-		return nil
+	if m.showRecent {
+		if _, ok := m.workingKeys[item.ScopeLabel()+"|"+item.Path]; !ok {
+			file := m.selectedRecentFile()
+			if file != nil {
+				return m.loadCommitDiffCmd(*file)
+			}
+		}
 	}
 	return m.loadDiffCmd(*item)
 }
@@ -1181,12 +1671,12 @@ func truncateText(input string, maxLen int) string {
 	return string(r[:maxLen-1]) + "…"
 }
 
-func renderFileWithHunks(path string, fullContent string, changed []git.LineRange, decor map[int]git.LineDecoration, hunksOnly bool, contextLines int) string {
-	highlighted := ui.HighlightForPath(path, fullContent)
+func (m *Model) renderFileWithHunks(path string, fullContent string, changed []git.LineRange, decor map[int]git.LineDecoration, hunksOnly bool, contextLines int) string {
+	highlighted := ui.HighlightForPath(path, fullContent, m.colors)
 	highlightedLines := strings.Split(highlighted, "\n")
 	rawLines := strings.Split(fullContent, "\n")
 	if !hunksOnly || len(changed) == 0 {
-		return renderNumberedLines(rawLines, highlightedLines, nil, decor)
+		return m.renderNumberedLines(rawLines, highlightedLines, nil, decor)
 	}
 
 	keep := make([]bool, len(rawLines))
@@ -1204,12 +1694,27 @@ func renderFileWithHunks(path string, fullContent string, changed []git.LineRang
 		}
 	}
 
-	return renderNumberedLines(rawLines, highlightedLines, keep, decor)
+	return m.renderNumberedLines(rawLines, highlightedLines, keep, decor)
 }
 
-func renderNumberedLines(rawLines []string, highlightedLines []string, keep []bool, decor map[int]git.LineDecoration) string {
+func (m *Model) renderNumberedLines(rawLines []string, highlightedLines []string, keep []bool, decor map[int]git.LineDecoration) string {
 	b := strings.Builder{}
 	skipped := false
+	hasAdded, hasDeleted := false, false
+	for _, d := range decor {
+		if d.Added {
+			hasAdded = true
+		}
+		if d.Deleted || len(d.DeletedLines) > 0 {
+			hasDeleted = true
+		}
+	}
+	highlightModifiedRows := hasAdded && hasDeleted
+	rowAddedBg := "\x1b[48;2;" + hexToRGBAnsi(m.colors.RowAddedBg) + "m"
+	rowRemovedBg := "\x1b[48;2;" + hexToRGBAnsi(m.colors.RowRemovedBg) + "m"
+	addedFg := "\x1b[38;2;" + hexToRGBAnsi(m.colors.Added) + "m"
+	removedFg := "\x1b[38;2;" + hexToRGBAnsi(m.colors.Removed) + "m"
+	lineSep := "\x1b[38;2;" + hexToRGBAnsi(m.colors.LineSep) + "m│\x1b[0m"
 	for i, rawLine := range rawLines {
 		if keep != nil && !keep[i] {
 			skipped = true
@@ -1221,8 +1726,12 @@ func renderNumberedLines(rawLines []string, highlightedLines []string, keep []bo
 		}
 		if d, ok := decor[i+1]; ok && len(d.DeletedLines) > 0 {
 			for _, deletedLine := range d.DeletedLines {
-				deletedRow := fmt.Sprintf("- %6s │ %s", "", deletedLine)
-				deletedRow = "\x1b[48;5;52m" + deletedRow
+				highlightedDeleted := ui.HighlightForPath("diff", deletedLine, m.colors)
+				highlightedDeleted = preserveBackgroundAcrossResets(highlightedDeleted)
+				deletedRow := fmt.Sprintf("%s-\x1b[0m %6s %s %s", removedFg, "", lineSep, highlightedDeleted)
+				if highlightModifiedRows {
+					deletedRow = rowRemovedBg + deletedRow + "\x1b[0m"
+				}
 				b.WriteString(deletedRow + "\n")
 			}
 		}
@@ -1234,22 +1743,30 @@ func renderNumberedLines(rawLines []string, highlightedLines []string, keep []bo
 		if d, ok := decor[i+1]; ok {
 			switch {
 			case d.Added && d.Deleted:
-				marker = "+"
+				marker = addedFg + "+\x1b[0m"
 			case d.Added:
-				marker = "+"
+				marker = addedFg + "+\x1b[0m"
 			case d.Deleted:
-				marker = "-"
+				marker = removedFg + "-\x1b[0m"
 			}
 		}
-		rowText := fmt.Sprintf("%s %6d │ %s", marker, i+1, line)
+		lineForRow := line
+		lineForRow = preserveBackgroundAcrossResets(lineForRow)
+		rowText := fmt.Sprintf("%s %6d %s %s", marker, i+1, lineSep, lineForRow)
 		if d, ok := decor[i+1]; ok {
 			switch {
 			case d.Added && d.Deleted:
-				rowText = "\x1b[48;5;22m" + fmt.Sprintf("+ %6d │ %s", i+1, rawLine)
+				if highlightModifiedRows {
+					rowText = rowAddedBg + fmt.Sprintf("%s+\x1b[0m %6d %s %s", addedFg, i+1, lineSep, lineForRow) + "\x1b[0m"
+				}
 			case d.Added:
-				rowText = "\x1b[48;5;22m" + fmt.Sprintf("+ %6d │ %s", i+1, rawLine)
+				if highlightModifiedRows {
+					rowText = rowAddedBg + fmt.Sprintf("%s+\x1b[0m %6d %s %s", addedFg, i+1, lineSep, lineForRow) + "\x1b[0m"
+				}
 			case d.Deleted:
-				rowText = "\x1b[48;5;52m" + fmt.Sprintf("- %6d │ %s", i+1, rawLine)
+				if highlightModifiedRows {
+					rowText = rowRemovedBg + fmt.Sprintf("%s-\x1b[0m %6d %s %s", removedFg, i+1, lineSep, lineForRow) + "\x1b[0m"
+				}
 			}
 		}
 		b.WriteString(rowText + "\n")
@@ -1265,6 +1782,7 @@ func renderNumberedLines(rawLines []string, highlightedLines []string, keep []bo
 func (m *Model) setDiffText(text string) {
 	m.diffRawLines = strings.Split(text, "\n")
 	m.diffXOffset = 0
+	m.diffChangeRows = collectChangeRows(m.diffRawLines)
 	m.refreshDiffViewport()
 }
 
@@ -1320,20 +1838,61 @@ func (m *Model) shiftDiffX(delta int) {
 	m.refreshDiffViewport()
 }
 
+func collectChangeRows(lines []string) []int {
+	out := make([]int, 0)
+	for i, line := range lines {
+		plain := ansi.Strip(line)
+		if strings.HasPrefix(plain, "+ ") || strings.HasPrefix(plain, "- ") || strings.HasPrefix(plain, "~ ") {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+func (m *Model) jumpToChange(forward bool) bool {
+	if len(m.diffChangeRows) == 0 {
+		return false
+	}
+	current := m.diff.YOffset
+	if forward {
+		for _, row := range m.diffChangeRows {
+			if row > current {
+				m.diff.SetYOffset(row)
+				return true
+			}
+		}
+		m.diff.SetYOffset(m.diffChangeRows[0])
+		return true
+	}
+	for i := len(m.diffChangeRows) - 1; i >= 0; i-- {
+		row := m.diffChangeRows[i]
+		if row < current {
+			m.diff.SetYOffset(row)
+			return true
+		}
+	}
+	m.diff.SetYOffset(m.diffChangeRows[len(m.diffChangeRows)-1])
+	return true
+}
+
 func (m *Model) renderTreePanel() string {
 	if m.leftHeight <= 0 {
 		return ""
 	}
-	bg := lipgloss.Color("#22283a")
-	selectedBg := lipgloss.Color("#101725")
+	bg := lipgloss.Color(m.colors.PanelLeftBg)
+	selectedBg := lipgloss.Color(m.colors.PanelRightBg)
 	if m.focus == focusChanges {
-		bg = lipgloss.Color("#2a3147")
-		selectedBg = lipgloss.Color("#0d1424")
+		bg = lipgloss.Color(m.colors.PanelActiveBg)
+		selectedBg = lipgloss.Color(m.colors.Bg)
 	}
 	normalStyle := lipgloss.NewStyle().Background(bg)
-	selectedStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color("#9cc8ff")).Bold(true)
-	folderStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color("#c9d4ee"))
-	fileStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color("#e8edf8"))
+	selectedStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color(m.colors.Accent)).Bold(true)
+	folderStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Muted))
+	fileStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Fg))
+	scrollRailStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Muted))
+	scrollThumbStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Accent))
+	scrollRailActiveStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color(m.colors.Muted))
+	scrollThumbActiveStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color(m.colors.Accent))
 
 	start := m.leftOffset
 	if start < 0 {
@@ -1352,20 +1911,71 @@ func (m *Model) renderTreePanel() string {
 
 	b := strings.Builder{}
 	renderWidth := maxInt(m.leftWidth, 8)
+	showScroll := len(m.treeRows) > m.leftHeight
+	contentWidth := renderWidth
+	thumbStart := 0
+	thumbEnd := 0
+	if showScroll {
+		contentWidth = maxInt(renderWidth-1, 4)
+		thumbSize := (m.leftHeight * m.leftHeight) / len(m.treeRows)
+		if thumbSize < 1 {
+			thumbSize = 1
+		}
+		if thumbSize > m.leftHeight {
+			thumbSize = m.leftHeight
+		}
+		maxStart := m.leftHeight - thumbSize
+		if maxStart < 0 {
+			maxStart = 0
+		}
+		denom := len(m.treeRows) - m.leftHeight
+		if denom > 0 {
+			thumbStart = (start * maxStart) / denom
+		}
+		thumbEnd = thumbStart + thumbSize
+	}
 	printed := 0
 	for i := start; i < end; i++ {
+		lineRow := printed
 		row := m.treeRows[i]
 		prefix := "  "
 		if i == m.selectedTree {
 			prefix = "❯ "
 		}
-		line := truncateText(prefix+row.text, maxInt(renderWidth, 4))
+		rowText := row.text
+		if row.kind == treeKindScope {
+			scope := strings.TrimPrefix(row.nodeID, "scope|")
+			if icon := m.scanIconForScope(scope); icon != "" {
+				rowText = renderScopeScanPrefix(row.text, icon)
+			}
+		}
+		status := " "
+		if row.kind == treeKindFile {
+			status = row.status
+		}
+		line := truncateText(prefix+status+" "+rowText, contentWidth)
+		if row.kind == treeKindFile {
+			line = strings.Replace(line, status+" ", statusWithColor(status, m.colors)+" ", 1)
+		}
 		if i == m.selectedTree {
-			b.WriteString(selectedStyle.Width(renderWidth).Render(line))
+			b.WriteString(selectedStyle.Width(contentWidth).Render(line))
 		} else if row.kind == treeKindScope || row.kind == treeKindDir {
-			b.WriteString(folderStyle.Width(renderWidth).Render(line))
+			b.WriteString(folderStyle.Width(contentWidth).Render(line))
 		} else {
-			b.WriteString(fileStyle.Width(renderWidth).Render(line))
+			b.WriteString(fileStyle.Width(contentWidth).Render(line))
+		}
+		if showScroll {
+			railStyle := scrollRailStyle
+			thumbStyle := scrollThumbStyle
+			if i == m.selectedTree {
+				railStyle = scrollRailActiveStyle
+				thumbStyle = scrollThumbActiveStyle
+			}
+			if lineRow >= thumbStart && lineRow < thumbEnd {
+				b.WriteString(thumbStyle.Render("█"))
+			} else {
+				b.WriteString(railStyle.Render("│"))
+			}
 		}
 		printed++
 		if printed < m.leftHeight {
@@ -1376,7 +1986,14 @@ func (m *Model) renderTreePanel() string {
 		if printed > 0 {
 			b.WriteByte('\n')
 		}
-		b.WriteString(normalStyle.Width(renderWidth).Render(""))
+		b.WriteString(normalStyle.Width(contentWidth).Render(""))
+		if showScroll {
+			if printed >= thumbStart && printed < thumbEnd {
+				b.WriteString(scrollThumbStyle.Render("█"))
+			} else {
+				b.WriteString(scrollRailStyle.Render("│"))
+			}
+		}
 		printed++
 	}
 
@@ -1545,7 +2162,7 @@ func (m *Model) expandAllTreeNodes() bool {
 	return true
 }
 
-func buildChangeTreeRows(changes []model.ChangeItem, scopeBranches map[string]string, collapsed map[string]bool) []treeRow {
+func buildChangeTreeRows(changes []model.ChangeItem, scopeBranches map[string]string, collapsed map[string]bool, rootName string) []treeRow {
 	roots := map[string]*treeBuildNode{}
 	rootOrder := []string{}
 	for _, c := range changes {
@@ -1569,7 +2186,7 @@ func buildChangeTreeRows(changes []model.ChangeItem, scopeBranches map[string]st
 		if !expanded {
 			icon = "▸"
 		}
-		header := scopeNodeLabel(scope, scopeBranches)
+		header := scopeNodeLabel(scope, scopeBranches, rootName)
 		rows = append(rows, treeRow{
 			id:         nodeID,
 			nodeID:     nodeID,
@@ -1622,13 +2239,15 @@ func flattenChangeNodeRows(n *treeBuildNode, depth int, parentID string, scope s
 	})
 	for _, f := range n.Files {
 		copy := f
+		status := displayStatusChange(f)
 		rows = append(rows, treeRow{
 			id:         "file|" + f.ScopeLabel() + "|" + string(f.Type) + "|" + f.Path,
 			nodeID:     "file|" + f.ScopeLabel() + "|" + f.Path,
 			parentID:   parentID,
 			depth:      depth,
 			kind:       treeKindFile,
-			text:       indent + statusLetter(f.Type) + " " + baseName(f.Path),
+			status:     status,
+			text:       indent + baseName(f.Path),
 			selectable: true,
 			change:     &copy,
 		})
@@ -1658,16 +2277,15 @@ func insertChangeNode(root *treeBuildNode, change model.ChangeItem) {
 	cur.Files = append(cur.Files, change)
 }
 
-func buildRecentTreeRows(files []model.CommitFile, scopeBranches map[string]string, collapsed map[string]bool) []treeRow {
+func buildRecentTreeRows(files []model.CommitFile, scopeBranches map[string]string, collapsed map[string]bool, rootName string) []treeRow {
 	changes := make([]model.ChangeItem, 0, len(files))
 	fileMap := map[string]model.CommitFile{}
 	for _, f := range files {
-		ctype := model.ChangeTypeUnstaged
-		changes = append(changes, model.ChangeItem{Path: f.Path, Type: ctype, SubmodulePath: f.SubmodulePath})
+		changes = append(changes, commitFileToChangeItem(f, ""))
 		key := f.Scope + "|" + f.Path
 		fileMap[key] = f
 	}
-	rows := buildChangeTreeRows(changes, scopeBranches, collapsed)
+	rows := buildChangeTreeRows(changes, scopeBranches, collapsed, rootName)
 	for i := range rows {
 		if rows[i].change != nil {
 			key := rows[i].change.ScopeLabel() + "|" + rows[i].change.Path
@@ -1676,32 +2294,70 @@ func buildRecentTreeRows(files []model.CommitFile, scopeBranches map[string]stri
 				rows[i].commitFile = &copy
 				rows[i].change = nil
 				rows[i].id = "recent|" + f.Scope + "|" + f.CommitHash + "|" + f.Path
-				rows[i].text = strings.Repeat("  ", rows[i].depth) + shortHash(f.CommitHash) + " " + baseName(f.Path)
+				rows[i].status = normalizeRecentStatus(f.Status)
+				rows[i].text = strings.Repeat("  ", rows[i].depth) + baseName(f.Path) + "  [" + shortHash(f.CommitHash) + "]"
 			}
 		}
 	}
 	return rows
 }
 
-func scopeNodeLabel(scope string, scopeBranches map[string]string) string {
+func commitFileToChangeItem(f model.CommitFile, repoRoot string) model.ChangeItem {
+	ctype := model.ChangeTypeUnstaged
+	status := strings.ToUpper(strings.TrimSpace(f.Status))
+	submodulePath := f.SubmodulePath
+	if !f.IsRoot {
+		if strings.TrimSpace(submodulePath) == "" {
+			submodulePath = f.Scope
+		}
+	}
+	item := model.ChangeItem{
+		RepoRoot:      repoRoot,
+		Path:          f.Path,
+		Type:          ctype,
+		SubmodulePath: submodulePath,
+	}
+	if f.IsRoot {
+		item.SubmodulePath = ""
+	}
+	if strings.HasPrefix(status, "A") {
+		item.WorktreeStatus = 'A'
+	} else if strings.HasPrefix(status, "D") {
+		item.WorktreeStatus = 'D'
+	} else {
+		item.WorktreeStatus = 'M'
+	}
+	return item
+}
+
+func scopeNodeLabel(scope string, scopeBranches map[string]string, rootName string) string {
 	branch := valueOr(scopeBranches[scope], "?")
 	if scope == "root" {
-		return fmt.Sprintf("/ (%s)", branch)
+		name := strings.TrimSpace(rootName)
+		if name == "" || name == "." || name == string(filepath.Separator) {
+			name = "root"
+		}
+		return fmt.Sprintf("%s (%s)", name, branch)
 	}
 	return fmt.Sprintf("%s (%s)", scope, branch)
 }
 
-func statusLetter(t model.ChangeType) string {
-	switch t {
-	case model.ChangeTypeStaged:
-		return "S"
-	case model.ChangeTypeUnstaged:
-		return "M"
-	case model.ChangeTypeUntracked:
-		return "A"
-	default:
-		return "?"
+func normalizeRecentStatus(status string) string {
+	s := strings.ToUpper(strings.TrimSpace(status))
+	if s == "A" || s == "M" || s == "D" {
+		return s
 	}
+	return "M"
+}
+
+func displayStatusChange(c model.ChangeItem) string {
+	if c.StagedStatus == 'D' || c.WorktreeStatus == 'D' {
+		return "D"
+	}
+	if c.Type == model.ChangeTypeUntracked || c.StagedStatus == 'A' || c.WorktreeStatus == 'A' {
+		return "A"
+	}
+	return "M"
 }
 
 func baseName(path string) string {
@@ -1802,7 +2458,7 @@ func renderChangeSummaryBlock(label string, items []model.ChangeItem) string {
 	paths := make([]string, 0, len(items))
 	for _, item := range items {
 		counts[item.Type]++
-		paths = append(paths, fmt.Sprintf("%s  %s", statusLetter(item.Type), item.Path))
+		paths = append(paths, fmt.Sprintf("%s  %s", displayStatusChange(item), item.Path))
 	}
 	sort.Strings(paths)
 	b.WriteString(fmt.Sprintf("Files: %d  (S:%d M:%d A:%d)\n\n", len(items), counts[model.ChangeTypeStaged], counts[model.ChangeTypeUnstaged], counts[model.ChangeTypeUntracked]))
@@ -1906,4 +2562,400 @@ func renderVerticalSep(height int) string {
 	}
 	line := strings.Repeat("│\n", height)
 	return strings.TrimRight(line, "\n")
+}
+
+func statusWithColor(status string, colors theme.Tokens) string {
+	switch status {
+	case "A":
+		return "\x1b[38;2;" + hexToRGBAnsi(colors.Added) + "mA\x1b[0m"
+	case "D":
+		return "\x1b[38;2;" + hexToRGBAnsi(colors.Removed) + "mD\x1b[0m"
+	case "M":
+		return "\x1b[38;2;" + hexToRGBAnsi(colors.Modified) + "mM\x1b[0m"
+	default:
+		return status
+	}
+}
+
+func hexToRGBAnsi(hex string) string {
+	h := strings.TrimPrefix(strings.TrimSpace(hex), "#")
+	if len(h) != 6 {
+		return "201;209;217"
+	}
+	r := parseHexByte(h[0:2])
+	g := parseHexByte(h[2:4])
+	b := parseHexByte(h[4:6])
+	return fmt.Sprintf("%d;%d;%d", r, g, b)
+}
+
+func parseHexByte(v string) int {
+	if len(v) != 2 {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 16, 32)
+	if err != nil {
+		return 0
+	}
+	return int(n)
+}
+
+func preserveBackgroundAcrossResets(input string) string {
+	if input == "" {
+		return input
+	}
+	return strings.ReplaceAll(input, "\x1b[0m", "\x1b[39m")
+}
+
+var scanSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func (m *Model) rootScanLabel() string {
+	name := strings.TrimSpace(m.rootName)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		return "root"
+	}
+	return name
+}
+
+func (m *Model) markScanRootDone() {
+	if len(m.scanStates) == 0 {
+		m.scanStates = []scanState{{path: "root", label: m.rootScanLabel(), status: "done"}}
+		return
+	}
+	m.scanStates[0].status = "done"
+	m.scanStates[0].err = ""
+}
+
+func (m *Model) setSubmoduleScanPaths(paths []string) {
+	root := scanState{path: "root", label: m.rootScanLabel(), status: "done"}
+	if len(m.scanStates) > 0 {
+		root = m.scanStates[0]
+	}
+	states := make([]scanState, 0, len(paths)+1)
+	states = append(states, root)
+	for _, p := range paths {
+		states = append(states, scanState{path: p, label: p, status: "pending"})
+	}
+	m.scanStates = states
+	m.scanActive = true
+}
+
+func (m *Model) markScanStatus(path string, status string, errText string) {
+	for i := range m.scanStates {
+		if m.scanStates[i].path != path {
+			continue
+		}
+		m.scanStates[i].status = status
+		m.scanStates[i].err = errText
+		return
+	}
+	m.scanStates = append(m.scanStates, scanState{path: path, label: path, status: status, err: errText})
+}
+
+func (m *Model) scanAllDone() bool {
+	if len(m.scanStates) == 0 {
+		return true
+	}
+	for i := 1; i < len(m.scanStates); i++ {
+		if m.scanStates[i].status == "pending" || m.scanStates[i].status == "loading" {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Model) scanProgressCounts() (int, int) {
+	if len(m.scanStates) <= 1 {
+		return 0, 0
+	}
+	done := 0
+	total := len(m.scanStates) - 1
+	for i := 1; i < len(m.scanStates); i++ {
+		s := m.scanStates[i].status
+		if s == "done" || s == "error" {
+			done++
+		}
+	}
+	return done, total
+}
+
+func (m *Model) renderScanStatus() string {
+	if len(m.scanStates) == 0 {
+		return ""
+	}
+	maxRows := minInt(maxInt(m.leftHeight/3, 2), len(m.scanStates))
+	b := strings.Builder{}
+	for i := 0; i < maxRows; i++ {
+		state := m.scanStates[i]
+		icon := "•"
+		switch state.status {
+		case "loading":
+			icon = scanSpinnerFrames[m.scanSpinner%len(scanSpinnerFrames)]
+		case "pending":
+			icon = "·"
+		case "done":
+			icon = "✓"
+		case "error":
+			icon = "!"
+		}
+		label := truncateText(state.label, maxInt(m.leftWidth-6, 8))
+		line := icon + " " + label
+		if state.status == "error" {
+			line = line + " (err)"
+		}
+		b.WriteString(line)
+		if i < maxRows-1 {
+			b.WriteByte('\n')
+		}
+	}
+	if len(m.scanStates) > maxRows {
+		b.WriteString("\n...")
+	}
+	return b.String()
+}
+
+func (m *Model) scanIconForScope(scope string) string {
+	for _, state := range m.scanStates {
+		if state.path != scope {
+			continue
+		}
+		switch state.status {
+		case "loading":
+			return scanSpinnerFrames[m.scanSpinner%len(scanSpinnerFrames)]
+		case "pending":
+			return "·"
+		case "done":
+			return "✓"
+		case "error":
+			return "!"
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func renderScopeScanPrefix(text string, icon string) string {
+	if icon == "" {
+		return text
+	}
+	if strings.HasPrefix(text, "▾ ") || strings.HasPrefix(text, "▸ ") {
+		return text[:len("▾ ")] + icon + " " + text[len("▾ "):]
+	}
+	return icon + " " + text
+}
+
+func (m *Model) renderRecentTabs() string {
+	filesLabel := "Files"
+	commitsLabel := "Commits"
+	active := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.colors.Accent))
+	inactive := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Muted))
+	if m.leftTab == leftTabFiles {
+		filesLabel = active.Render("[" + filesLabel + "]")
+		commitsLabel = inactive.Render("[" + commitsLabel + "]")
+	} else {
+		filesLabel = inactive.Render("[" + filesLabel + "]")
+		commitsLabel = active.Render("[" + commitsLabel + "]")
+	}
+	return filesLabel + " | " + commitsLabel
+}
+
+func (m *Model) nextLeftTab() {
+	if m.leftTab == leftTabFiles {
+		m.leftTab = leftTabCommits
+		return
+	}
+	m.leftTab = leftTabFiles
+}
+
+func (m *Model) prevLeftTab() {
+	m.nextLeftTab()
+}
+
+func (m *Model) previewCmdForActiveTab() tea.Cmd {
+	if m.leftTab == leftTabCommits {
+		return m.loadSelectedCommitSummaryCmd()
+	}
+	return m.autoLoadSelectedDiff()
+}
+
+func (m *Model) ensureCommitCursorInBounds() {
+	if len(m.rootHistory) == 0 {
+		m.commitCursor = -1
+		m.commitOffset = 0
+		return
+	}
+	if m.commitCursor < 0 {
+		m.commitCursor = 0
+	}
+	if m.commitCursor >= len(m.rootHistory) {
+		m.commitCursor = len(m.rootHistory) - 1
+	}
+	if m.commitCursor < m.commitOffset {
+		m.commitOffset = m.commitCursor
+	}
+	if m.leftHeight > 0 && m.commitCursor >= m.commitOffset+m.leftHeight {
+		m.commitOffset = m.commitCursor - m.leftHeight + 1
+	}
+	if m.commitOffset < 0 {
+		m.commitOffset = 0
+	}
+}
+
+func (m *Model) moveCommitSelection(delta int) {
+	if len(m.rootHistory) == 0 || delta == 0 {
+		return
+	}
+	if m.commitCursor < 0 {
+		m.commitCursor = 0
+	}
+	m.commitCursor += delta
+	if m.commitCursor < 0 {
+		m.commitCursor = 0
+	}
+	if m.commitCursor >= len(m.rootHistory) {
+		m.commitCursor = len(m.rootHistory) - 1
+	}
+	m.ensureCommitCursorInBounds()
+}
+
+func (m *Model) pageCommitSelection(direction int) {
+	step := maxInt(m.leftHeight-1, 1)
+	if direction < 0 {
+		step = -step
+	}
+	m.moveCommitSelection(step)
+}
+
+func (m *Model) selectedRootCommit() *model.RepoCommit {
+	if m.commitCursor < 0 || m.commitCursor >= len(m.rootHistory) {
+		return nil
+	}
+	copy := m.rootHistory[m.commitCursor]
+	return &copy
+}
+
+func (m *Model) renderCommitPanel() string {
+	if len(m.rootHistory) == 0 {
+		return m.styles.Muted.Render("No root commits loaded")
+	}
+	m.ensureCommitCursorInBounds()
+	start := m.commitOffset
+	if start < 0 {
+		start = 0
+	}
+	end := start + m.leftHeight
+	if end > len(m.rootHistory) {
+		end = len(m.rootHistory)
+	}
+	bg := lipgloss.Color(m.colors.PanelLeftBg)
+	selectedBg := lipgloss.Color(m.colors.PanelRightBg)
+	if m.focus == focusChanges {
+		bg = lipgloss.Color(m.colors.PanelActiveBg)
+		selectedBg = lipgloss.Color(m.colors.Bg)
+	}
+	normalStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Fg))
+	selectedStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color(m.colors.Accent)).Bold(true)
+	b := strings.Builder{}
+	printed := 0
+	for i := start; i < end; i++ {
+		commit := m.rootHistory[i]
+		prefix := "  "
+		if i == m.commitCursor {
+			prefix = "❯ "
+		}
+		line := truncateText(prefix+shortHash(commit.Hash)+"  "+commit.Subject, maxInt(m.leftWidth, 8))
+		if i == m.commitCursor {
+			b.WriteString(selectedStyle.Width(maxInt(m.leftWidth, 8)).Render(line))
+		} else {
+			b.WriteString(normalStyle.Width(maxInt(m.leftWidth, 8)).Render(line))
+		}
+		printed++
+		if printed < m.leftHeight {
+			b.WriteByte('\n')
+		}
+	}
+	for printed < m.leftHeight {
+		if printed > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(normalStyle.Width(maxInt(m.leftWidth, 8)).Render(""))
+		printed++
+	}
+	return b.String()
+}
+
+func (m *Model) loadSelectedCommitSummaryCmd() tea.Cmd {
+	commit := m.selectedRootCommit()
+	if commit == nil {
+		return nil
+	}
+	requestID := m.requestID
+	hash := commit.Hash
+	m.setDiffText("Loading commit details...")
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		summary, err := git.LoadRootCommitSummary(ctx, m.runner, m.repoPath, hash)
+		return commitSummaryLoadedMsg{requestID: requestID, hash: hash, summary: summary, err: err}
+	}
+}
+
+func renderCommitSummary(summary model.CommitSummary) string {
+	b := strings.Builder{}
+	b.WriteString("commit ")
+	b.WriteString(summary.Hash)
+	b.WriteString("\n")
+	b.WriteString("Author: ")
+	b.WriteString(summary.Author)
+	if summary.Email != "" {
+		b.WriteString(" <")
+		b.WriteString(summary.Email)
+		b.WriteString(">")
+	}
+	b.WriteString("\nDate:   ")
+	b.WriteString(summary.When.Local().Format(time.RFC3339))
+	b.WriteString("\n\n")
+	b.WriteString(summary.Subject)
+	b.WriteString("\n")
+	if summary.Body != "" {
+		b.WriteString("\n")
+		b.WriteString(summary.Body)
+		b.WriteString("\n")
+	}
+	if len(summary.Parents) > 0 {
+		b.WriteString("\nParents: ")
+		b.WriteString(strings.Join(summary.Parents, " "))
+		b.WriteString("\n")
+	}
+	if summary.ShortStat != "" {
+		b.WriteString("\nStats: ")
+		b.WriteString(summary.ShortStat)
+		b.WriteString("\n")
+	}
+	b.WriteString("\nFiles:\n")
+	for i, file := range summary.Files {
+		b.WriteString("  ")
+		b.WriteString(file.Status)
+		b.WriteString("  ")
+		b.WriteString(file.Path)
+		if i < len(summary.Files)-1 {
+			b.WriteByte('\n')
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func resolveAnchorIndex(history []model.RepoCommit, currentHash string) int {
+	if len(history) == 0 {
+		return 0
+	}
+	if strings.TrimSpace(currentHash) == "" {
+		return 0
+	}
+	for i, commit := range history {
+		if commit.Hash == currentHash || strings.HasPrefix(commit.Hash, currentHash) {
+			return i
+		}
+	}
+	return 0
 }

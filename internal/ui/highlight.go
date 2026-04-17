@@ -8,10 +8,10 @@ import (
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/formatters"
 	"github.com/alecthomas/chroma/v2/lexers"
-	"github.com/alecthomas/chroma/v2/styles"
+	"gitriot/internal/theme"
 )
 
-func HighlightForPath(path string, content string) string {
+func HighlightForPath(path string, content string, colors theme.Tokens) string {
 	lexer := lexers.Match(path)
 	if lexer == nil {
 		lexer = lexers.Analyse(content)
@@ -31,10 +31,20 @@ func HighlightForPath(path string, content string) string {
 		return content
 	}
 
-	style := styles.Get("github-dark")
-	if style == nil {
-		style = styles.Fallback
-	}
+	style := chroma.MustNewStyle("gitriot-theme", chroma.StyleEntries{
+		chroma.Background:    "bg:" + colors.Bg,
+		chroma.Text:          colors.SyntaxPlain,
+		chroma.Keyword:       colors.SyntaxKeyword,
+		chroma.KeywordType:   colors.SyntaxKeyword,
+		chroma.NameFunction:  colors.SyntaxFunc,
+		chroma.NameBuiltin:   colors.SyntaxFunc,
+		chroma.NameClass:     colors.SyntaxType,
+		chroma.LiteralString: colors.SyntaxString,
+		chroma.LiteralNumber: colors.SyntaxNumber,
+		chroma.Comment:       colors.SyntaxComment,
+		chroma.Operator:      colors.SyntaxOperator,
+		chroma.Punctuation:   colors.SyntaxPunct,
+	})
 
 	var out bytes.Buffer
 	if err := formatter.Format(&out, style, iterator); err != nil {

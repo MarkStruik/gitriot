@@ -17,6 +17,7 @@ func main() {
 	themeFlag := flag.String("theme", "", "Theme name from ~/.gitriot/themes")
 	themeFileFlag := flag.String("theme-file", "", "Absolute path to theme YAML file")
 	recentWindowFlag := flag.Duration("recent-window", 0, "Time window around root last commit (example: 90m, 2h)")
+	sinceCommitFlag := flag.String("since-commit", "", "Root commit hash (partial or full): show changes from that commit timestamp to now")
 	noAltScreenFlag := flag.Bool("no-alt-screen", false, "Disable alternate screen mode (useful for embedded terminals)")
 	flag.Parse()
 
@@ -68,6 +69,7 @@ func main() {
 		RepoPath:     repoPath,
 		Theme:        selectedTheme,
 		RecentWindow: *recentWindowFlag,
+		SinceCommit:  *sinceCommitFlag,
 	}
 
 	programOptions := []tea.ProgramOption{}
