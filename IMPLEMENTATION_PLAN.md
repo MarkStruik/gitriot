@@ -37,6 +37,10 @@
 - Step 14 completed with CLI startup wiring and flags in `cmd/gitriot/main.go`.
 - Step 15 completed with tests and docs in `internal/*/*_test.go`, `README.md`, and `RELEASE_NOTES.md`.
 - Added post-plan enhancement: recent commit snapshot across root + submodules with `--recent-window` and `c` toggle.
+- Added hash-anchored commit range mode: `--since-commit <partial-hash>` loads commits/files from anchor timestamp to now.
+- Added recent-mode left tabs (`[Files] | [Commits]`) with commit preview and `enter` apply flow.
+- Updated left pane tabs to be always visible; `c` now returns to current-changes-only mode.
+- Added live tree scroll indicator and in-tree module scan status spinners for long/async file lists.
 
 ## Requested Future Features
 - Add a coordinated "commit all" workflow that can commit root repository and submodules in one guided action.

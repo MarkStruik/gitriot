@@ -19,6 +19,11 @@ Run with recent commit window enabled:
 docker run --rm -it -v "${PWD}:/src" -w /src golang:1.24 sh -c "go run ./cmd/gitriot --repo . --recent-window 2h"
 ```
 
+Run from a specific root commit timestamp to now (partial hash supported):
+```bash
+docker run --rm -it -v "${PWD}:/src" -w /src golang:1.24 sh -c "go run ./cmd/gitriot --repo . --since-commit a1b2c3d"
+```
+
 Run in embedded terminals (disable alternate screen):
 ```bash
 docker run --rm -it -v "${PWD}:/src" -w /src golang:1.24 sh -c "go run ./cmd/gitriot --repo . --no-alt-screen"
@@ -57,14 +62,31 @@ Example theme file:
 ```yaml
 name: default
 colors:
-  bg: "#111418"
-  fg: "#E6E9EF"
-  muted: "#8A93A6"
-  accent: "#5EA1FF"
-  added: "#2FBF71"
-  removed: "#E05D5D"
-  hunk: "#E0B84F"
-  border: "#2A3140"
+  bg: "#0d1117"
+  panel_left_bg: "#161b22"
+  panel_right_bg: "#1f2430"
+  panel_active_bg: "#2d333b"
+  fg: "#c9d1d9"
+  muted: "#8b949e"
+  accent: "#58a6ff"
+  added: "#3fb950"
+  removed: "#f85149"
+  modified: "#d29922"
+  hunk: "#d29922"
+  border: "#30363d"
+  line_sep: "#6e7681"
+  row_added_bg: "#1a472a"
+  row_removed_bg: "#4b1d1d"
+  row_modified_bg: "#4b3a19"
+  syntax_plain: "#c9d1d9"
+  syntax_keyword: "#ff7b72"
+  syntax_string: "#a5d6ff"
+  syntax_comment: "#8b949e"
+  syntax_type: "#ffa657"
+  syntax_func: "#d2a8ff"
+  syntax_number: "#79c0ff"
+  syntax_operator: "#ff7b72"
+  syntax_punct: "#c9d1d9"
 ```
 
 ## Keybindings
@@ -81,7 +103,9 @@ colors:
 - `u`: toggle unstaged changes
 - `n`: toggle untracked changes
 - `m`: toggle submodule changes
-- `c`: toggle recent commit snapshot view (requires `--recent-window`)
+- `c`: return to current-changes-only view (and re-enable live auto-refresh)
+- `[` / `]` (left pane): switch `[Files] | [Commits]` tab
+- `enter` (Commits tab): apply selected root commit anchor (timestamp -> now) and switch back to Files tab
 - `/`: open search input
 - `esc`: close search input
 - `r`: refresh index
@@ -89,6 +113,9 @@ colors:
 ## Notes
 - GitRiot currently shells out to native Git CLI commands.
 - Submodule failures are reported as warnings; the app remains interactive.
-- Recent commit view is anchored to the root repository last commit and includes submodules whose last commit time is within the provided window.
+- `--since-commit <hash>` uses the selected root commit timestamp as anchor and loads root + submodule commits from that time to now.
+- Left tabs are always available: Files and Commits. The Commits tab previews selected commit details in the right pane.
+- While viewing an older merged range, live background refresh of working changes is paused; pressing `c` returns to current-only and resumes live refresh.
+- The files tree shows a scrollbar indicator when more rows exist than fit in the pane viewport.
 - In recent mode, the left pane lists files from those commits and selecting a file auto-loads its commit diff.
 - Embedded terminals (for example Rider/JetBrains terminal) may render better with `--no-alt-screen`.
