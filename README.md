@@ -2,6 +2,8 @@
 
 GitRiot is a keyboard-first terminal diff command center for Git repositories and submodules.
 
+<img width="1984" height="1289" alt="image" src="https://github.com/user-attachments/assets/8afe4db9-bcf9-4845-aee8-1b997f50f0c4" />
+
 ## Current MVP
 - Unified change list for root repo and submodules
 - Staged, unstaged, untracked, and submodule filtering
