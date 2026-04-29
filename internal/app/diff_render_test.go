@@ -156,6 +156,32 @@ func TestRenderVisibleDiffRowUsesThemeBackgroundForHighlightedCode(t *testing.T)
 	}
 }
 
+func TestThemePickerKeepsDiffPaneVisible(t *testing.T) {
+	themeFile := theme.Default
+	m := NewModel(Option{
+		RepoPath:  ".",
+		Theme:     themeFile,
+		ThemeName: "default",
+		Themes:    theme.Builtins(),
+		SaveTheme: nil,
+	})
+	m.ready = true
+	m.width = 120
+	m.height = 30
+	m.diffRows = buildPlainDiffRows([]string{"Path: visible.js", "", "visible-diff-line"})
+	m.diffRawLines = []string{"Path: visible.js", "", "visible-diff-line"}
+	m.openThemePicker()
+	m.resize()
+
+	view := ansi.Strip(m.View())
+	if !strings.Contains(view, "Themes") {
+		t.Fatalf("expected theme picker pane in view, got %q", view)
+	}
+	if !strings.Contains(view, "visible-diff-line") {
+		t.Fatalf("expected diff pane to remain visible while picking a theme, got %q", view)
+	}
+}
+
 func stripRenderedLines(input string) []string {
 	rawLines := strings.Split(input, "\n")
 	out := make([]string, 0, len(rawLines))

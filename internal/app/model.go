@@ -392,30 +392,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			switch {
 			case key.Matches(keyMsg, keys.CloseSearch), key.Matches(keyMsg, keys.ThemePicker):
-				m.closeThemePicker(false)
-				return m, nil
+				return m, m.closeThemePicker(false)
 			case keyMsg.Type == tea.KeyEnter:
-				m.closeThemePicker(true)
-				return m, nil
+				return m, m.closeThemePicker(true)
 			case key.Matches(keyMsg, keys.Up):
-				m.moveThemeSelection(-1)
-				return m, nil
+				return m, m.moveThemeSelection(-1)
 			case key.Matches(keyMsg, keys.Down):
-				m.moveThemeSelection(1)
-				return m, nil
+				return m, m.moveThemeSelection(1)
 			case key.Matches(keyMsg, keys.PageUp):
-				m.moveThemeSelection(-5)
-				return m, nil
+				return m, m.moveThemeSelection(-5)
 			case key.Matches(keyMsg, keys.PageDown):
-				m.moveThemeSelection(5)
-				return m, nil
+				return m, m.moveThemeSelection(5)
 			default:
-				m.filterThemeList(m.themeSearch.Value())
-				return m, cmd
+				previewCmd := m.filterThemeList(m.themeSearch.Value())
+				return m, tea.Batch(cmd, previewCmd)
 			}
 		}
-		m.filterThemeList(m.themeSearch.Value())
-		return m, cmd
+		previewCmd := m.filterThemeList(m.themeSearch.Value())
+		return m, tea.Batch(cmd, previewCmd)
 	}
 
 	if m.focus == focusSearch {
@@ -687,8 +681,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.loadIndexCmd()
 		case key.Matches(msg, keys.ThemePicker):
-			m.openThemePicker()
-			return m, textinput.Blink
+			return m, tea.Batch(textinput.Blink, m.openThemePicker())
 		case key.Matches(msg, keys.PrevAnchor):
 			if m.focus != focusChanges {
 				return m, nil
@@ -952,7 +945,11 @@ func (m Model) View() string {
 
 	leftWidth, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
 	top := m.renderTopBar()
-	left := lipgloss.NewStyle().Height(paneHeight).MaxHeight(paneHeight).Render(m.renderChangesPane(leftWidth, paneHeight))
+	leftContent := m.renderChangesPane(leftWidth, paneHeight)
+	if m.showThemePicker {
+		leftContent = m.renderThemePickerPane(leftWidth, paneHeight)
+	}
+	left := lipgloss.NewStyle().Height(paneHeight).MaxHeight(paneHeight).Render(leftContent)
 	right := lipgloss.NewStyle().Height(paneHeight).MaxHeight(paneHeight).Render(m.renderDiffPane(rightWidth, paneHeight))
 	sep := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.LineSep)).Render(renderVerticalSep(paneHeight))
 	panes := lipgloss.NewStyle().Height(paneHeight).MaxHeight(paneHeight).Render(lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right))
@@ -962,9 +959,6 @@ func (m Model) View() string {
 	if m.focus == focusSearch {
 		search := m.styles.SearchPrompt.Render("Search: ") + m.search.View()
 		base = lipgloss.JoinVertical(lipgloss.Left, base, search)
-	}
-	if m.showThemePicker {
-		base = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderThemePickerModal(), lipgloss.WithWhitespaceBackground(lipgloss.Color(m.colors.Bg)))
 	}
 	if m.showKeybinds {
 		base = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderKeybindModal(), lipgloss.WithWhitespaceBackground(lipgloss.Color(m.colors.Bg)))
@@ -1140,20 +1134,25 @@ func (m *Model) renderKeybindModal() string {
 	return box
 }
 
-func (m *Model) renderThemePickerModal() string {
-	lines := []string{"Themes", "", m.styles.SearchPrompt.Render("Search: ") + m.themeSearch.View(), ""}
+func (m *Model) renderThemePickerPane(width int, height int) string {
+	bg := lipgloss.Color(m.colors.PanelLeftBg)
+	titleBg := lipgloss.Color(darkenHexColor(m.colors.Accent, 0.72))
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.colors.Bg)).Background(titleBg).Width(width).Render("* Themes")
+	search := lipgloss.NewStyle().Background(bg).Width(width).Render(m.styles.SearchPrompt.Render("Search: ") + m.themeSearch.View())
+	bodyHeight := maxInt(height-4, 1)
+	lines := make([]string, 0, bodyHeight)
 	if len(m.themeList) == 0 {
 		lines = append(lines, m.styles.Muted.Render("No themes match filter"))
 	} else {
 		start := 0
-		if m.themeCursor >= 8 {
-			start = m.themeCursor - 7
+		if m.themeCursor >= bodyHeight {
+			start = m.themeCursor - bodyHeight + 1
 		}
-		end := minInt(start+10, len(m.themeList))
+		end := minInt(start+bodyHeight, len(m.themeList))
 		for i := start; i < end; i++ {
 			entry := m.themeList[i]
 			prefix := "  "
-			style := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Fg))
+			style := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Fg)).Background(bg)
 			if i == m.themeCursor {
 				prefix = "❯ "
 				style = style.Bold(true).Foreground(lipgloss.Color(m.colors.Accent))
@@ -1162,22 +1161,19 @@ func (m *Model) renderThemePickerModal() string {
 			if entry.Kind != "" {
 				label += "  [" + entry.Kind + "]"
 			}
-			lines = append(lines, style.Render(prefix+label))
+			lines = append(lines, style.Width(width).Render(truncateText(prefix+label, maxInt(width-1, 1))))
 		}
 	}
-	lines = append(lines, "", m.styles.Muted.Render("Enter apply and save | Esc cancel and revert"))
-	content := strings.Join(lines, "\n")
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(m.colors.Accent)).
-		Background(lipgloss.Color(m.colors.PanelRightBg)).
-		Foreground(lipgloss.Color(m.colors.Fg)).
-		Padding(1, 2).
-		Width(maxInt(minInt(m.width-8, 72), 36)).
-		Render(content)
+	for len(lines) < bodyHeight {
+		lines = append(lines, lipgloss.NewStyle().Background(bg).Width(width).Render(""))
+	}
+	body := lipgloss.NewStyle().Background(bg).Width(width).Height(bodyHeight).Render(strings.Join(lines, "\n"))
+	help := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Muted)).Background(bg).Width(width).Render("enter apply | esc cancel")
+	panel := lipgloss.JoinVertical(lipgloss.Left, title, search, body, help)
+	return lipgloss.NewStyle().Background(bg).Width(width).Height(maxInt(height, 3)).Render(panel)
 }
 
-func (m *Model) openThemePicker() {
+func (m *Model) openThemePicker() tea.Cmd {
 	m.showThemePicker = true
 	m.themeSearch.SetValue("")
 	m.themeSearch.Focus()
@@ -1186,22 +1182,22 @@ func (m *Model) openThemePicker() {
 	}
 	m.pickerTheme = m.currentTheme
 	m.pickerThemeName = m.currentThemeName
-	m.filterThemeList("")
-	m.previewSelectedTheme()
+	previewCmd := m.filterThemeList("")
+	return previewCmd
 }
 
-func (m *Model) closeThemePicker(apply bool) {
+func (m *Model) closeThemePicker(apply bool) tea.Cmd {
 	m.showThemePicker = false
 	m.themeSearch.Blur()
 	if !apply {
 		m.applyTheme(m.pickerThemeName, m.pickerTheme)
 		m.message = "Theme preview cancelled"
-		return
+		return m.refreshSelectedDiffForThemeCmd()
 	}
 	if len(m.themeList) == 0 {
 		m.applyTheme(m.pickerThemeName, m.pickerTheme)
 		m.message = "No theme selected"
-		return
+		return m.refreshSelectedDiffForThemeCmd()
 	}
 	entry := m.themeList[m.themeCursor]
 	m.applyTheme(entry.Name, entry.Theme)
@@ -1209,13 +1205,14 @@ func (m *Model) closeThemePicker(apply bool) {
 		if err := m.saveTheme(entry.Name); err != nil {
 			m.warn = append(m.warn, "save theme failed: "+err.Error())
 			m.message = "Theme applied, but config save failed"
-			return
+			return m.refreshSelectedDiffForThemeCmd()
 		}
 	}
 	m.message = "Theme applied: " + entry.Name
+	return m.refreshSelectedDiffForThemeCmd()
 }
 
-func (m *Model) filterThemeList(query string) {
+func (m *Model) filterThemeList(query string) tea.Cmd {
 	q := strings.ToLower(strings.TrimSpace(query))
 	filtered := make([]theme.NamedTheme, 0, len(m.allThemes))
 	for _, entry := range m.allThemes {
@@ -1229,13 +1226,13 @@ func (m *Model) filterThemeList(query string) {
 	if len(filtered) == 0 {
 		m.themeCursor = 0
 		m.applyTheme(m.pickerThemeName, m.pickerTheme)
-		return
+		return m.refreshSelectedDiffForThemeCmd()
 	}
 	for i, entry := range filtered {
 		if entry.Name == m.currentThemeName {
 			m.themeCursor = i
 			m.previewSelectedTheme()
-			return
+			return m.refreshSelectedDiffForThemeCmd()
 		}
 	}
 	if m.themeCursor >= len(filtered) {
@@ -1245,11 +1242,12 @@ func (m *Model) filterThemeList(query string) {
 		}
 	}
 	m.previewSelectedTheme()
+	return m.refreshSelectedDiffForThemeCmd()
 }
 
-func (m *Model) moveThemeSelection(delta int) {
+func (m *Model) moveThemeSelection(delta int) tea.Cmd {
 	if len(m.themeList) == 0 || delta == 0 {
-		return
+		return nil
 	}
 	m.themeCursor += delta
 	if m.themeCursor < 0 {
@@ -1259,6 +1257,7 @@ func (m *Model) moveThemeSelection(delta int) {
 		m.themeCursor = len(m.themeList) - 1
 	}
 	m.previewSelectedTheme()
+	return m.refreshSelectedDiffForThemeCmd()
 }
 
 func (m *Model) previewSelectedTheme() {
@@ -1276,6 +1275,14 @@ func (m *Model) applyTheme(name string, selected theme.FileTheme) {
 	m.colors = selected.Colors
 	m.styles = ui.NewStyles(selected)
 	m.refreshDiffViewport()
+}
+
+func (m *Model) refreshSelectedDiffForThemeCmd() tea.Cmd {
+	if !m.currentSelectionIsFile() {
+		return nil
+	}
+	m.lastSelID = ""
+	return m.autoLoadSelectedDiff()
 }
 
 func (m *Model) loadIndexCmd() tea.Cmd {
