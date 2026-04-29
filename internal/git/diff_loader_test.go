@@ -48,3 +48,24 @@ func TestBaseCommitBeforeExcludesAnchorSecond(t *testing.T) {
 		t.Fatalf("expected previous second in rev-list args, got %q", joinedArgs)
 	}
 }
+
+func TestParseLineDecorationsDoesNotMarkFollowingContextAsDeleted(t *testing.T) {
+	patch := strings.Join([]string{
+		"@@ -11,17 +11,12 @@",
+		"     <GridLayout AutoExpandColumn=\"Title\" DefaultSortColumn=\"OccurredOnUtc\" DefaultSortDirection=\"Descending\">",
+		"         <ColumnProperty PropertyName=\"Title\" DefaultWidth=\"260\"/>",
+		"+        <ColumnProperty PropertyName=\"ProcessingStatus\" DefaultWidth=\"140\"/>",
+		"+        <ColumnProperty PropertyName=\"ProcessedOnUtc\" DefaultWidth=\"180\"/>",
+		"         <ColumnProperty PropertyName=\"Direction\" DefaultWidth=\"120\"/>",
+		"-        <ColumnProperty PropertyName=\"MessageKind\" DefaultWidth=\"120\"/>",
+		"         <ColumnProperty PropertyName=\"TransactionType\" DefaultWidth=\"100\"/>",
+	}, "\n")
+
+	decor := ParseLineDecorationsFromPatch(patch)
+	if !decor[13].Added || !decor[14].Added {
+		t.Fatalf("expected added rows at 13 and 14, got %#v", decor)
+	}
+	if got := decor[16]; got.Deleted || len(got.DeletedLines) != 1 {
+		t.Fatalf("expected line 16 to anchor one deleted row without marking the current row deleted, got %#v", got)
+	}
+}

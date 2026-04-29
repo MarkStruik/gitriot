@@ -251,7 +251,6 @@ func ParseLineDecorationsFromPatch(patch string) map[int]LineDecoration {
 				target = 1
 			}
 			d := decor[target]
-			d.Deleted = true
 			d.DeletedLines = append(d.DeletedLines, strings.TrimPrefix(line, "-"))
 			decor[target] = d
 			oldLine++

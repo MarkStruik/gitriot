@@ -156,6 +156,61 @@ func TestRenderVisibleDiffRowUsesThemeBackgroundForHighlightedCode(t *testing.T)
 	}
 }
 
+func TestBuildNumberedDiffRowsDoesNotMarkFollowingContextAsDeleted(t *testing.T) {
+	patch := strings.Join([]string{
+		"@@ -11,17 +11,12 @@",
+		"     <GridLayout AutoExpandColumn=\"Title\" DefaultSortColumn=\"OccurredOnUtc\" DefaultSortDirection=\"Descending\">",
+		"         <ColumnProperty PropertyName=\"Title\" DefaultWidth=\"260\"/>",
+		"+        <ColumnProperty PropertyName=\"ProcessingStatus\" DefaultWidth=\"140\"/>",
+		"+        <ColumnProperty PropertyName=\"ProcessedOnUtc\" DefaultWidth=\"180\"/>",
+		"         <ColumnProperty PropertyName=\"Direction\" DefaultWidth=\"120\"/>",
+		"-        <ColumnProperty PropertyName=\"MessageKind\" DefaultWidth=\"120\"/>",
+		"         <ColumnProperty PropertyName=\"TransactionType\" DefaultWidth=\"100\"/>",
+	}, "\n")
+	fullContent := strings.Join([]string{
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		"    <GridLayout AutoExpandColumn=\"Title\" DefaultSortColumn=\"OccurredOnUtc\" DefaultSortDirection=\"Descending\">",
+		"        <ColumnProperty PropertyName=\"Title\" DefaultWidth=\"260\"/>",
+		"        <ColumnProperty PropertyName=\"ProcessingStatus\" DefaultWidth=\"140\"/>",
+		"        <ColumnProperty PropertyName=\"ProcessedOnUtc\" DefaultWidth=\"180\"/>",
+		"        <ColumnProperty PropertyName=\"Direction\" DefaultWidth=\"120\"/>",
+		"        <ColumnProperty PropertyName=\"TransactionType\" DefaultWidth=\"100\"/>",
+		"        <ColumnProperty PropertyName=\"GatewayOri\" DefaultWidth=\"140\"/>",
+	}, "\n")
+
+	m := Model{colors: theme.Default.Colors}
+	rows := m.buildFileDiffRows("view.xml", fullContent, git.ParseChangedLineRangesFromPatch(patch), git.ParseLineDecorationsFromPatch(patch), true, 5)
+
+	var messageKindRow *diffRow
+	var transactionTypeRow *diffRow
+	for i := range rows {
+		if strings.Contains(rows[i].code, "MessageKind") {
+			messageKindRow = &rows[i]
+		}
+		if strings.Contains(rows[i].code, "TransactionType") {
+			transactionTypeRow = &rows[i]
+		}
+	}
+	if messageKindRow == nil || messageKindRow.marker != "-" {
+		t.Fatalf("expected inserted deleted MessageKind row, got %#v", messageKindRow)
+	}
+	if transactionTypeRow == nil {
+		t.Fatal("expected TransactionType row")
+	}
+	if transactionTypeRow.marker != " " || transactionTypeRow.codeBg != "" {
+		t.Fatalf("expected TransactionType to remain unchanged, got marker=%q codeBg=%q", transactionTypeRow.marker, transactionTypeRow.codeBg)
+	}
+}
+
 func TestThemePickerKeepsDiffPaneVisible(t *testing.T) {
 	themeFile := theme.Default
 	m := NewModel(Option{

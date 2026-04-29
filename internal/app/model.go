@@ -2003,21 +2003,7 @@ func (m *Model) buildNumberedDiffRows(rawLines []string, highlightedLines []stri
 			skipped = false
 		}
 		if d, ok := decor[i+1]; ok && len(d.DeletedLines) > 0 {
-			for _, deletedLine := range d.DeletedLines {
-				highlightedDeleted := ui.HighlightForPath("diff", deletedLine, m.colors)
-				highlightedDeleted = expandTabsANSI(highlightedDeleted, 4)
-				highlightedDeleted = preserveBackgroundAcrossResets(highlightedDeleted)
-				rows = append(rows, diffRow{
-					kind:     diffRowCode,
-					marker:   "-",
-					lineNo:   "",
-					code:     highlightedDeleted,
-					markerFg: removedFg,
-					codeBg:   chooseTint(highlightDeletedRows, ansiBg(m.colors.RowRemovedBg)),
-					gutterBg: chooseTint(highlightDeletedRows, ansiBg(darkenHexColor(m.colors.RowRemovedBg, 0.72))),
-					isChange: true,
-				})
-			}
+			rows = appendDeletedDiffRows(rows, d.DeletedLines, removedFg, highlightDeletedRows, m.colors)
 		}
 		line := rawLine
 		if i < len(highlightedLines) {
@@ -2066,11 +2052,33 @@ func (m *Model) buildNumberedDiffRows(rawLines []string, highlightedLines []stri
 		}
 		rows = append(rows, row)
 	}
+	if d, ok := decor[len(rawLines)+1]; ok && len(d.DeletedLines) > 0 {
+		rows = appendDeletedDiffRows(rows, d.DeletedLines, removedFg, highlightDeletedRows, m.colors)
+	}
 
 	if len(rows) == 0 {
 		return buildPlainDiffRows([]string{"No lines to display"})
 	}
 
+	return rows
+}
+
+func appendDeletedDiffRows(rows []diffRow, deletedLines []string, removedFg string, highlightDeletedRows bool, colors theme.Tokens) []diffRow {
+	for _, deletedLine := range deletedLines {
+		highlightedDeleted := ui.HighlightForPath("diff", deletedLine, colors)
+		highlightedDeleted = expandTabsANSI(highlightedDeleted, 4)
+		highlightedDeleted = preserveBackgroundAcrossResets(highlightedDeleted)
+		rows = append(rows, diffRow{
+			kind:     diffRowCode,
+			marker:   "-",
+			lineNo:   "",
+			code:     highlightedDeleted,
+			markerFg: removedFg,
+			codeBg:   chooseTint(highlightDeletedRows, ansiBg(colors.RowRemovedBg)),
+			gutterBg: chooseTint(highlightDeletedRows, ansiBg(darkenHexColor(colors.RowRemovedBg, 0.72))),
+			isChange: true,
+		})
+	}
 	return rows
 }
 
