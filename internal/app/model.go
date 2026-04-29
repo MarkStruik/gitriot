@@ -122,6 +122,7 @@ type Model struct {
 	diffRawLines    []string
 	diffXOffset     int
 	diffChangeRows  []int
+	cachedDiff      *cachedDiffView
 }
 
 type diffRowKind int
@@ -141,6 +142,16 @@ type diffRow struct {
 	codeBg   string
 	gutterBg string
 	isChange bool
+}
+
+type cachedDiffView struct {
+	header       []string
+	path         string
+	fullContent  string
+	changed      []git.LineRange
+	decor        map[int]git.LineDecoration
+	hunksOnly    bool
+	contextLines int
 }
 
 type treeRow struct {
@@ -185,6 +196,7 @@ type diffLoadedMsg struct {
 	requestID int
 	lines     []string
 	rows      []diffRow
+	cache     *cachedDiffView
 	isBinary  bool
 	empty     bool
 	err       error
@@ -638,6 +650,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		m.cachedDiff = msg.cache
 		if len(msg.rows) > 0 {
 			m.diffRows = msg.rows
 			m.diffRawLines = diffRowsToRawLines(msg.rows)
@@ -1192,12 +1205,12 @@ func (m *Model) closeThemePicker(apply bool) tea.Cmd {
 	if !apply {
 		m.applyTheme(m.pickerThemeName, m.pickerTheme)
 		m.message = "Theme preview cancelled"
-		return m.refreshSelectedDiffForThemeCmd()
+		return nil
 	}
 	if len(m.themeList) == 0 {
 		m.applyTheme(m.pickerThemeName, m.pickerTheme)
 		m.message = "No theme selected"
-		return m.refreshSelectedDiffForThemeCmd()
+		return nil
 	}
 	entry := m.themeList[m.themeCursor]
 	m.applyTheme(entry.Name, entry.Theme)
@@ -1205,11 +1218,11 @@ func (m *Model) closeThemePicker(apply bool) tea.Cmd {
 		if err := m.saveTheme(entry.Name); err != nil {
 			m.warn = append(m.warn, "save theme failed: "+err.Error())
 			m.message = "Theme applied, but config save failed"
-			return m.refreshSelectedDiffForThemeCmd()
+			return nil
 		}
 	}
 	m.message = "Theme applied: " + entry.Name
-	return m.refreshSelectedDiffForThemeCmd()
+	return nil
 }
 
 func (m *Model) filterThemeList(query string) tea.Cmd {
@@ -1226,13 +1239,13 @@ func (m *Model) filterThemeList(query string) tea.Cmd {
 	if len(filtered) == 0 {
 		m.themeCursor = 0
 		m.applyTheme(m.pickerThemeName, m.pickerTheme)
-		return m.refreshSelectedDiffForThemeCmd()
+		return nil
 	}
 	for i, entry := range filtered {
 		if entry.Name == m.currentThemeName {
 			m.themeCursor = i
 			m.previewSelectedTheme()
-			return m.refreshSelectedDiffForThemeCmd()
+			return nil
 		}
 	}
 	if m.themeCursor >= len(filtered) {
@@ -1242,7 +1255,7 @@ func (m *Model) filterThemeList(query string) tea.Cmd {
 		}
 	}
 	m.previewSelectedTheme()
-	return m.refreshSelectedDiffForThemeCmd()
+	return nil
 }
 
 func (m *Model) moveThemeSelection(delta int) tea.Cmd {
@@ -1257,7 +1270,7 @@ func (m *Model) moveThemeSelection(delta int) tea.Cmd {
 		m.themeCursor = len(m.themeList) - 1
 	}
 	m.previewSelectedTheme()
-	return m.refreshSelectedDiffForThemeCmd()
+	return nil
 }
 
 func (m *Model) previewSelectedTheme() {
@@ -1274,15 +1287,10 @@ func (m *Model) applyTheme(name string, selected theme.FileTheme) {
 	m.currentThemeName = name
 	m.colors = selected.Colors
 	m.styles = ui.NewStyles(selected)
-	m.refreshDiffViewport()
-}
-
-func (m *Model) refreshSelectedDiffForThemeCmd() tea.Cmd {
-	if !m.currentSelectionIsFile() {
-		return nil
+	if m.rebuildCachedDiffRows() {
+		return
 	}
-	m.lastSelID = ""
-	return m.autoLoadSelectedDiff()
+	m.refreshDiffViewport()
 }
 
 func (m *Model) loadIndexCmd() tea.Cmd {
@@ -1375,8 +1383,9 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 
 		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 		decor := git.ParseLineDecorationsFromPatch(result.Patch)
-		rows := append(buildPlainDiffRows([]string{"Path: " + activeRef, ""}), m.buildFileDiffRows(req.Path, full, ranges, decor, showHunksOnly, 5)...)
-		return diffLoadedMsg{requestID: requestID, rows: rows, empty: result.Empty}
+		cache := &cachedDiffView{header: []string{"Path: " + activeRef, ""}, path: req.Path, fullContent: full, changed: ranges, decor: decor, hunksOnly: showHunksOnly, contextLines: 5}
+		rows := m.buildCachedDiffRows(cache)
+		return diffLoadedMsg{requestID: requestID, rows: rows, cache: cache, empty: result.Empty}
 	}
 }
 
@@ -1700,8 +1709,9 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 
 			ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 			decor := git.ParseLineDecorationsFromPatch(result.Patch)
-			rows := append(buildPlainDiffRows([]string{"Path: " + activeRef, ""}), m.buildFileDiffRows(file.Path, full, ranges, decor, showHunksOnly, 5)...)
-			return diffLoadedMsg{requestID: requestID, rows: rows, empty: result.Empty}
+			cache := &cachedDiffView{header: []string{"Path: " + activeRef, ""}, path: file.Path, fullContent: full, changed: ranges, decor: decor, hunksOnly: showHunksOnly, contextLines: 5}
+			rows := m.buildCachedDiffRows(cache)
+			return diffLoadedMsg{requestID: requestID, rows: rows, cache: cache, empty: result.Empty}
 		}
 	}
 
@@ -1742,8 +1752,9 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 
 		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 		decor := git.ParseLineDecorationsFromPatch(result.Patch)
-		rows := append(buildPlainDiffRows([]string{"Path: " + activeRef, ""}), m.buildFileDiffRows(file.Path, full, ranges, decor, showHunksOnly, 5)...)
-		return diffLoadedMsg{requestID: requestID, rows: rows, empty: result.Empty}
+		cache := &cachedDiffView{header: []string{"Path: " + activeRef, ""}, path: file.Path, fullContent: full, changed: ranges, decor: decor, hunksOnly: showHunksOnly, contextLines: 5}
+		rows := m.buildCachedDiffRows(cache)
+		return diffLoadedMsg{requestID: requestID, rows: rows, cache: cache, empty: result.Empty}
 	}
 }
 
@@ -1952,6 +1963,30 @@ func (m *Model) buildFileDiffRows(path string, fullContent string, changed []git
 	return m.buildNumberedDiffRows(rawLines, highlightedLines, keep, decor)
 }
 
+func (m *Model) buildCachedDiffRows(cache *cachedDiffView) []diffRow {
+	if cache == nil {
+		return nil
+	}
+	rows := buildPlainDiffRows(cache.header)
+	rows = append(rows, m.buildFileDiffRows(cache.path, cache.fullContent, cache.changed, cache.decor, cache.hunksOnly, cache.contextLines)...)
+	return rows
+}
+
+func (m *Model) rebuildCachedDiffRows() bool {
+	if m.cachedDiff == nil {
+		return false
+	}
+	yOffset := m.diff.YOffset
+	xOffset := m.diffXOffset
+	m.diffRows = m.buildCachedDiffRows(m.cachedDiff)
+	m.diffRawLines = diffRowsToRawLines(m.diffRows)
+	m.diffChangeRows = collectChangeRowIndexes(m.diffRows)
+	m.diffXOffset = xOffset
+	m.refreshDiffViewport()
+	m.diff.SetYOffset(yOffset)
+	return true
+}
+
 func (m *Model) buildNumberedDiffRows(rawLines []string, highlightedLines []string, keep []bool, decor map[int]git.LineDecoration) []diffRow {
 	rows := make([]diffRow, 0, len(rawLines)+len(decor))
 	skipped := false
@@ -2102,6 +2137,7 @@ func diffRowsToRawLines(rows []diffRow) []string {
 }
 
 func (m *Model) setDiffText(text string) {
+	m.cachedDiff = nil
 	m.diffRawLines = strings.Split(text, "\n")
 	m.diffRows = buildPlainDiffRows(m.diffRawLines)
 	m.diffXOffset = 0
