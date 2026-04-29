@@ -105,9 +105,29 @@ type Model struct {
 	lastSelID       string
 	activeRef       string
 	lastFingerprint string
+	diffRows        []diffRow
 	diffRawLines    []string
 	diffXOffset     int
 	diffChangeRows  []int
+}
+
+type diffRowKind int
+
+const (
+	diffRowPlain diffRowKind = iota
+	diffRowGap
+	diffRowCode
+)
+
+type diffRow struct {
+	kind     diffRowKind
+	marker   string
+	lineNo   string
+	code     string
+	markerFg string
+	codeBg   string
+	gutterBg string
+	isChange bool
 }
 
 type treeRow struct {
@@ -151,6 +171,7 @@ type indexLoadedMsg struct {
 type diffLoadedMsg struct {
 	requestID int
 	lines     []string
+	rows      []diffRow
 	isBinary  bool
 	empty     bool
 	err       error
@@ -249,14 +270,14 @@ var keys = keyMap{
 	FilterUnstaged:  key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "toggle unstaged")),
 	FilterUntracked: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "toggle untracked")),
 	FilterSubmodule: key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle submodule")),
-	CollapseNode:    key.NewBinding(key.WithKeys("left"), key.WithHelp("←", "collapse")),
+	CollapseNode:    key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("←/h", "collapse/left")),
 	ExpandNode:      key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "expand")),
 	ToggleNode:      key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "toggle")),
 	CollapseAll:     key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "collapse all")),
 	ExpandAll:       key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "expand all")),
 	PrevAnchor:      key.NewBinding(key.WithKeys("["), key.WithHelp("[", "prev tab")),
 	NextAnchor:      key.NewBinding(key.WithKeys("]"), key.WithHelp("]", "next tab")),
-	ToggleHunksOnly: key.NewBinding(key.WithKeys("h", "H"), key.WithHelp("h", "toggle hunks/full")),
+	ToggleHunksOnly: key.NewBinding(key.WithKeys("f", "F"), key.WithHelp("f", "toggle hunks/full")),
 	NextChange:      key.NewBinding(key.WithKeys("}"), key.WithHelp("}", "next change")),
 	PrevChange:      key.NewBinding(key.WithKeys("{"), key.WithHelp("{", "prev change")),
 	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "current only")),
@@ -299,6 +320,7 @@ func NewModel(opt Option) Model {
 		recentWindow:  opt.RecentWindow,
 		sinceCommit:   strings.TrimSpace(opt.SinceCommit),
 		useSinceMode:  strings.TrimSpace(opt.SinceCommit) != "",
+		showRecent:    strings.TrimSpace(opt.SinceCommit) != "",
 		showHunksOnly: true,
 		anchorIndex:   0,
 		anchorHash:    strings.TrimSpace(opt.SinceCommit),
@@ -421,9 +443,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.warn = msg.result.Warnings
 		m.lastFingerprint = msg.fingerprint
 		m.allItems = msg.result.Items
-		if m.useSinceMode {
-			m.showRecent = true
-		}
 		if !m.showRecent {
 			m.recentVisible = nil
 		}
@@ -567,9 +586,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		m.diffRawLines = msg.lines
+		if len(msg.rows) > 0 {
+			m.diffRows = msg.rows
+			m.diffRawLines = diffRowsToRawLines(msg.rows)
+		} else {
+			m.diffRawLines = msg.lines
+			m.diffRows = buildPlainDiffRows(msg.lines)
+		}
 		m.diffXOffset = 0
-		m.diffChangeRows = collectChangeRows(msg.lines)
+		m.diffChangeRows = collectChangeRowIndexes(m.diffRows)
 		m.refreshDiffViewport()
 		if msg.isBinary {
 			m.message = "Binary diff loaded"
@@ -866,10 +891,10 @@ func (m Model) View() string {
 
 	leftWidth, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
 	top := m.renderTopBar()
-	left := m.renderChangesPane(leftWidth, paneHeight)
-	right := m.renderDiffPane(rightWidth, paneHeight)
+	left := lipgloss.NewStyle().Height(paneHeight).MaxHeight(paneHeight).Render(m.renderChangesPane(leftWidth, paneHeight))
+	right := lipgloss.NewStyle().Height(paneHeight).MaxHeight(paneHeight).Render(m.renderDiffPane(rightWidth, paneHeight))
 	sep := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.LineSep)).Render(renderVerticalSep(paneHeight))
-	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right)
+	panes := lipgloss.NewStyle().Height(paneHeight).MaxHeight(paneHeight).Render(lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right))
 	bottom := m.renderBottomBar()
 
 	base := lipgloss.JoinVertical(lipgloss.Left, top, panes, bottom)
@@ -878,10 +903,10 @@ func (m Model) View() string {
 		base = lipgloss.JoinVertical(lipgloss.Left, base, search)
 	}
 	if m.showKeybinds {
-		base = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderKeybindModal())
+		base = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderKeybindModal(), lipgloss.WithWhitespaceBackground(lipgloss.Color(m.colors.Bg)))
 	}
 
-	return m.styles.Frame.Width(m.width).Height(m.height).MaxWidth(m.width).MaxHeight(m.height).Render(base)
+	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, base, lipgloss.WithWhitespaceBackground(lipgloss.Color(m.colors.Bg)))
 }
 
 func (m *Model) resize() {
@@ -891,11 +916,10 @@ func (m *Model) resize() {
 
 	leftWidth, rightWidth, paneHeight := paneDimensions(m.width, m.height, m.focus == focusSearch)
 
-	contentHeight := maxInt(paneHeight-4, 1)
-	m.leftWidth = maxInt(leftWidth-4, 8)
-	m.leftHeight = maxInt(contentHeight, 1)
-	m.diff.Width = rightWidth - 4
-	m.diff.Height = contentHeight
+	m.leftWidth = maxInt(leftWidth, 8)
+	m.leftHeight = maxInt(paneHeight-2, 1)
+	m.diff.Width = maxInt(rightWidth-1, 8)
+	m.diff.Height = maxInt(paneHeight-1, 1)
 	if m.leftTab == leftTabCommits {
 		m.ensureCommitCursorInBounds()
 	} else {
@@ -913,36 +937,41 @@ func (m *Model) rotateFocus() {
 }
 
 func (m *Model) renderTopBar() string {
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.colors.Accent)).Render("GitRiot")
-	return m.styles.Status.Width(m.width).Render(title)
+	barBg := lipgloss.Color(m.colors.Accent)
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.colors.Bg)).Background(barBg).Render(" GitRiot ")
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Bg)).Background(barBg).Width(m.width).Render(title)
 }
 
 func (m *Model) renderChangesPane(width int, height int) string {
+	bg := lipgloss.Color(m.colors.PanelLeftBg)
 	titleText := "Changes"
 	titlePrefix := "  "
 	if m.focus == focusChanges {
 		titlePrefix = "* "
 	}
-	title := m.styles.Title.Render(titlePrefix + titleText)
+	titleLine := titlePrefix + titleText
 	if m.loading {
-		title = title + " " + m.styles.Muted.Render("(loading)")
+		titleLine += " (loading)"
 	}
+	titleBg := bg
+	titleFg := lipgloss.Color(m.colors.Muted)
+	if m.focus == focusChanges {
+		titleBg = lipgloss.Color(darkenHexColor(m.colors.Accent, 0.72))
+		titleFg = lipgloss.Color(m.colors.Bg)
+	}
+	title := lipgloss.NewStyle().Bold(true).Foreground(titleFg).Background(titleBg).Width(width).Render(titleLine)
 
-	tabLine := m.renderRecentTabs()
+	tabLine := m.renderRecentTabs(width, bg)
 	body := m.renderTreePanel()
 	if m.leftTab == leftTabCommits {
 		body = m.renderCommitPanel()
 	} else if len(m.treeRows) == 0 {
-		body = m.styles.Muted.Render("No changes match filters")
+		body = lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Muted)).Background(bg).Width(width).Render("No changes match filters")
 	}
 	panelParts := []string{title}
 	panelParts = append(panelParts, tabLine)
 	panelParts = append(panelParts, body)
 	panel := lipgloss.JoinVertical(lipgloss.Left, panelParts...)
-	bg := lipgloss.Color(m.colors.PanelLeftBg)
-	if m.focus == focusChanges {
-		bg = lipgloss.Color(m.colors.PanelActiveBg)
-	}
 	return lipgloss.NewStyle().Background(bg).Width(width).Height(maxInt(height, 3)).Render(panel)
 }
 
@@ -973,14 +1002,16 @@ func (m *Model) renderDiffPane(width int, height int) string {
 	if m.focus == focusDiff {
 		titlePrefix = "* "
 	}
-	title := m.styles.Title.Render(titlePrefix + titleText)
-
-	body := m.diff.View()
-	panel := lipgloss.JoinVertical(lipgloss.Left, title, body)
 	bg := lipgloss.Color(m.colors.PanelRightBg)
+	titleBg := bg
+	titleFg := lipgloss.Color(m.colors.Muted)
 	if m.focus == focusDiff {
-		bg = lipgloss.Color(m.colors.PanelActiveBg)
+		titleBg = lipgloss.Color(darkenHexColor(m.colors.Accent, 0.72))
+		titleFg = lipgloss.Color(m.colors.Bg)
 	}
+	title := lipgloss.NewStyle().Bold(true).Foreground(titleFg).Background(titleBg).Width(width).Render(titlePrefix + titleText)
+	body := m.renderDiffBody(width, maxInt(height-1, 1), bg)
+	panel := lipgloss.JoinVertical(lipgloss.Left, title, body)
 	return lipgloss.NewStyle().Background(bg).Width(width).Height(maxInt(height, 3)).Render(panel)
 }
 
@@ -990,11 +1021,12 @@ func (m *Model) renderBottomBar() string {
 		msg = "Ready"
 	}
 	line := truncateText(msg, maxInt(m.width-2, 10))
-	line = m.styles.Muted.Render(line)
+	barBg := lipgloss.Color(m.colors.Bg)
+	line = lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Muted)).Background(barBg).Width(m.width).Render(line)
 
 	active := m.activeKeybindSummary()
 	active = truncateText(active+"  |  ? help", maxInt(m.width-2, 10))
-	activeLine := m.styles.Title.Render(active)
+	activeLine := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Accent)).Background(barBg).Bold(true).Width(m.width).Render(active)
 
 	return lipgloss.JoinVertical(lipgloss.Left, line, activeLine)
 }
@@ -1004,15 +1036,15 @@ func (m *Model) activeKeybindSummary() string {
 		return "SEARCH  type filter  enter apply  esc close"
 	}
 	if m.focus == focusDiff {
-		return "DIFF  h hunks/full  { prev change  } next change  ←/→ pan"
+		return "DIFF  f hunks/full  { prev change  } next change  h/← pan left  l/→ pan right"
 	}
 	if m.leftTab == leftTabCommits {
 		return "COMMITS  ↑/↓ move  enter apply+switch  [ ] tabs"
 	}
 	if m.showRecent {
-		return "FILES  ↑/↓ move  enter open  ← collapse  →/l expand  x/X all  c current only"
+		return "FILES  ↑/↓ move  enter open  ←/h collapse  →/l expand  x/X all  c current only"
 	}
-	return "FILES  ↑/↓ move  enter open  ← collapse  →/l expand  x/X all  c current only"
+	return "FILES  ↑/↓ move  enter open  ←/h collapse  →/l expand  x/X all  c current only"
 }
 
 func (m *Model) renderKeybindModal() string {
@@ -1020,10 +1052,10 @@ func (m *Model) renderKeybindModal() string {
 		"Keybindings",
 		"",
 		"Global: q quit | tab switch pane | r refresh | / search | c current only | ? help",
-		"Tree:   ↑/↓ move | enter toggle folder | ← collapse | →/l expand | space toggle | x/X all",
+		"Tree:   ↑/↓ move | enter toggle folder | ←/h collapse | →/l expand | space toggle | x/X all",
 		"Tabs:   [ prev tab | ] next tab | Commits tab: enter apply anchor and switch to Files",
 		"Mode:   c return to current-only view (live updates enabled)",
-		"Diff:   h hunks/full | { prev change | } next change | ←/→ pan horizontally",
+		"Diff:   f hunks/full | { prev change | } next change | h/← pan left | l/→ pan right",
 		"Search: type query | enter apply | esc close",
 		"",
 		"Press ? or esc to close",
@@ -1130,8 +1162,8 @@ func (m *Model) loadDiffCmd(item model.ChangeItem) tea.Cmd {
 
 		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 		decor := git.ParseLineDecorationsFromPatch(result.Patch)
-		view := "Path: " + activeRef + "\n\n" + m.renderFileWithHunks(req.Path, full, ranges, decor, showHunksOnly, 5)
-		return diffLoadedMsg{requestID: requestID, lines: strings.Split(view, "\n"), empty: result.Empty}
+		rows := append(buildPlainDiffRows([]string{"Path: " + activeRef, ""}), m.buildFileDiffRows(req.Path, full, ranges, decor, showHunksOnly, 5)...)
+		return diffLoadedMsg{requestID: requestID, rows: rows, empty: result.Empty}
 	}
 }
 
@@ -1448,8 +1480,8 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 
 			ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 			decor := git.ParseLineDecorationsFromPatch(result.Patch)
-			view := "Path: " + activeRef + "\n\n" + m.renderFileWithHunks(file.Path, full, ranges, decor, showHunksOnly, 5)
-			return diffLoadedMsg{requestID: requestID, lines: strings.Split(view, "\n"), empty: result.Empty}
+			rows := append(buildPlainDiffRows([]string{"Path: " + activeRef, ""}), m.buildFileDiffRows(file.Path, full, ranges, decor, showHunksOnly, 5)...)
+			return diffLoadedMsg{requestID: requestID, rows: rows, empty: result.Empty}
 		}
 	}
 
@@ -1490,8 +1522,8 @@ func (m *Model) loadCommitDiffCmd(file model.CommitFile) tea.Cmd {
 
 		ranges := git.ParseChangedLineRangesFromPatch(result.Patch)
 		decor := git.ParseLineDecorationsFromPatch(result.Patch)
-		view := "Path: " + activeRef + "\n\n" + m.renderFileWithHunks(file.Path, full, ranges, decor, showHunksOnly, 5)
-		return diffLoadedMsg{requestID: requestID, lines: strings.Split(view, "\n"), empty: result.Empty}
+		rows := append(buildPlainDiffRows([]string{"Path: " + activeRef, ""}), m.buildFileDiffRows(file.Path, full, ranges, decor, showHunksOnly, 5)...)
+		return diffLoadedMsg{requestID: requestID, rows: rows, empty: result.Empty}
 	}
 }
 
@@ -1515,6 +1547,9 @@ func (m *Model) autoLoadSelectedDiff() tea.Cmd {
 	}
 	selectionID := m.currentSelectionID()
 	if selectionID == "" {
+		m.activeRef = ""
+		m.setDiffText("No current file selection.\n\nUse [ ] to switch to Commits.")
+		m.message = "No file selected"
 		return nil
 	}
 	if selectionID == m.lastSelID {
@@ -1671,12 +1706,12 @@ func truncateText(input string, maxLen int) string {
 	return string(r[:maxLen-1]) + "…"
 }
 
-func (m *Model) renderFileWithHunks(path string, fullContent string, changed []git.LineRange, decor map[int]git.LineDecoration, hunksOnly bool, contextLines int) string {
+func (m *Model) buildFileDiffRows(path string, fullContent string, changed []git.LineRange, decor map[int]git.LineDecoration, hunksOnly bool, contextLines int) []diffRow {
 	highlighted := ui.HighlightForPath(path, fullContent, m.colors)
 	highlightedLines := strings.Split(highlighted, "\n")
 	rawLines := strings.Split(fullContent, "\n")
 	if !hunksOnly || len(changed) == 0 {
-		return m.renderNumberedLines(rawLines, highlightedLines, nil, decor)
+		return m.buildNumberedDiffRows(rawLines, highlightedLines, nil, decor)
 	}
 
 	keep := make([]bool, len(rawLines))
@@ -1694,13 +1729,114 @@ func (m *Model) renderFileWithHunks(path string, fullContent string, changed []g
 		}
 	}
 
-	return m.renderNumberedLines(rawLines, highlightedLines, keep, decor)
+	return m.buildNumberedDiffRows(rawLines, highlightedLines, keep, decor)
 }
 
-func (m *Model) renderNumberedLines(rawLines []string, highlightedLines []string, keep []bool, decor map[int]git.LineDecoration) string {
-	b := strings.Builder{}
+func (m *Model) buildNumberedDiffRows(rawLines []string, highlightedLines []string, keep []bool, decor map[int]git.LineDecoration) []diffRow {
+	rows := make([]diffRow, 0, len(rawLines)+len(decor))
 	skipped := false
-	hasAdded, hasDeleted := false, false
+	highlightAddedRows, highlightDeletedRows := classifyDiffRowHighlights(rawLines, decor)
+	addedFg := ansiFg(m.colors.Added)
+	removedFg := ansiFg(m.colors.Removed)
+	for i, rawLine := range rawLines {
+		if keep != nil && !keep[i] {
+			skipped = true
+			continue
+		}
+		if skipped {
+			rows = append(rows, diffRow{kind: diffRowGap})
+			skipped = false
+		}
+		if d, ok := decor[i+1]; ok && len(d.DeletedLines) > 0 {
+			for _, deletedLine := range d.DeletedLines {
+				highlightedDeleted := ui.HighlightForPath("diff", deletedLine, m.colors)
+				highlightedDeleted = expandTabsANSI(highlightedDeleted, 4)
+				highlightedDeleted = preserveBackgroundAcrossResets(highlightedDeleted)
+				rows = append(rows, diffRow{
+					kind:     diffRowCode,
+					marker:   "-",
+					lineNo:   "",
+					code:     highlightedDeleted,
+					markerFg: removedFg,
+					codeBg:   chooseTint(highlightDeletedRows, ansiBg(m.colors.RowRemovedBg)),
+					gutterBg: chooseTint(highlightDeletedRows, ansiBg(darkenHexColor(m.colors.RowRemovedBg, 0.72))),
+					isChange: true,
+				})
+			}
+		}
+		line := rawLine
+		if i < len(highlightedLines) {
+			line = highlightedLines[i]
+		}
+		line = expandTabsANSI(line, 4)
+		marker := " "
+		markerFg := ""
+		if d, ok := decor[i+1]; ok {
+			switch {
+			case d.Added && d.Deleted:
+				marker = "+"
+				markerFg = addedFg
+			case d.Added:
+				marker = "+"
+				markerFg = addedFg
+			case d.Deleted:
+				marker = "-"
+				markerFg = removedFg
+			}
+		}
+		lineForRow := line
+		lineForRow = preserveBackgroundAcrossResets(lineForRow)
+		row := diffRow{kind: diffRowCode, marker: marker, lineNo: strconv.Itoa(i + 1), code: lineForRow, markerFg: markerFg}
+		if d, ok := decor[i+1]; ok {
+			switch {
+			case d.Added && d.Deleted:
+				if highlightAddedRows {
+					row.codeBg = ansiBg(m.colors.RowAddedBg)
+					row.gutterBg = ansiBg(darkenHexColor(m.colors.RowAddedBg, 0.72))
+				}
+				row.isChange = true
+			case d.Added:
+				if highlightAddedRows {
+					row.codeBg = ansiBg(m.colors.RowAddedBg)
+					row.gutterBg = ansiBg(darkenHexColor(m.colors.RowAddedBg, 0.72))
+				}
+				row.isChange = true
+			case d.Deleted:
+				if highlightDeletedRows {
+					row.codeBg = ansiBg(m.colors.RowRemovedBg)
+					row.gutterBg = ansiBg(darkenHexColor(m.colors.RowRemovedBg, 0.72))
+				}
+				row.isChange = true
+			}
+		}
+		rows = append(rows, row)
+	}
+
+	if len(rows) == 0 {
+		return buildPlainDiffRows([]string{"No lines to display"})
+	}
+
+	return rows
+}
+
+func classifyDiffRowHighlights(rawLines []string, decor map[int]git.LineDecoration) (highlightAddedRows bool, highlightDeletedRows bool) {
+	hasAdded := false
+	hasDeleted := false
+	allRawLinesAdded := len(rawLines) > 0
+	allRawLinesDeleted := len(rawLines) > 0
+	for i := range rawLines {
+		d, ok := decor[i+1]
+		if ok && d.Added {
+			hasAdded = true
+		} else {
+			allRawLinesAdded = false
+		}
+		if ok && d.Deleted {
+			hasDeleted = true
+		} else {
+			allRawLinesDeleted = false
+		}
+	}
 	for _, d := range decor {
 		if d.Added {
 			hasAdded = true
@@ -1709,120 +1845,288 @@ func (m *Model) renderNumberedLines(rawLines []string, highlightedLines []string
 			hasDeleted = true
 		}
 	}
-	highlightModifiedRows := hasAdded && hasDeleted
-	rowAddedBg := "\x1b[48;2;" + hexToRGBAnsi(m.colors.RowAddedBg) + "m"
-	rowRemovedBg := "\x1b[48;2;" + hexToRGBAnsi(m.colors.RowRemovedBg) + "m"
-	addedFg := "\x1b[38;2;" + hexToRGBAnsi(m.colors.Added) + "m"
-	removedFg := "\x1b[38;2;" + hexToRGBAnsi(m.colors.Removed) + "m"
-	lineSep := "\x1b[38;2;" + hexToRGBAnsi(m.colors.LineSep) + "m│\x1b[0m"
-	for i, rawLine := range rawLines {
-		if keep != nil && !keep[i] {
-			skipped = true
-			continue
-		}
-		if skipped {
-			b.WriteString("...\n")
-			skipped = false
-		}
-		if d, ok := decor[i+1]; ok && len(d.DeletedLines) > 0 {
-			for _, deletedLine := range d.DeletedLines {
-				highlightedDeleted := ui.HighlightForPath("diff", deletedLine, m.colors)
-				highlightedDeleted = preserveBackgroundAcrossResets(highlightedDeleted)
-				deletedRow := fmt.Sprintf("%s-\x1b[0m %6s %s %s", removedFg, "", lineSep, highlightedDeleted)
-				if highlightModifiedRows {
-					deletedRow = rowRemovedBg + deletedRow + "\x1b[0m"
-				}
-				b.WriteString(deletedRow + "\n")
-			}
-		}
-		line := rawLine
-		if i < len(highlightedLines) {
-			line = highlightedLines[i]
-		}
-		marker := " "
-		if d, ok := decor[i+1]; ok {
-			switch {
-			case d.Added && d.Deleted:
-				marker = addedFg + "+\x1b[0m"
-			case d.Added:
-				marker = addedFg + "+\x1b[0m"
-			case d.Deleted:
-				marker = removedFg + "-\x1b[0m"
-			}
-		}
-		lineForRow := line
-		lineForRow = preserveBackgroundAcrossResets(lineForRow)
-		rowText := fmt.Sprintf("%s %6d %s %s", marker, i+1, lineSep, lineForRow)
-		if d, ok := decor[i+1]; ok {
-			switch {
-			case d.Added && d.Deleted:
-				if highlightModifiedRows {
-					rowText = rowAddedBg + fmt.Sprintf("%s+\x1b[0m %6d %s %s", addedFg, i+1, lineSep, lineForRow) + "\x1b[0m"
-				}
-			case d.Added:
-				if highlightModifiedRows {
-					rowText = rowAddedBg + fmt.Sprintf("%s+\x1b[0m %6d %s %s", addedFg, i+1, lineSep, lineForRow) + "\x1b[0m"
-				}
-			case d.Deleted:
-				if highlightModifiedRows {
-					rowText = rowRemovedBg + fmt.Sprintf("%s-\x1b[0m %6d %s %s", removedFg, i+1, lineSep, lineForRow) + "\x1b[0m"
-				}
-			}
-		}
-		b.WriteString(rowText + "\n")
-	}
+	highlightAddedRows = hasAdded && !allRawLinesAdded
+	highlightDeletedRows = hasDeleted && !allRawLinesDeleted
+	return highlightAddedRows, highlightDeletedRows
+}
 
-	if b.Len() == 0 {
-		return "No lines to display"
+func chooseTint(enabled bool, color string) string {
+	if !enabled {
+		return ""
 	}
+	return color
+}
 
-	return strings.TrimRight(b.String(), "\n")
+func buildPlainDiffRows(lines []string) []diffRow {
+	rows := make([]diffRow, 0, len(lines))
+	for _, line := range lines {
+		rows = append(rows, diffRow{kind: diffRowPlain, code: line})
+	}
+	if len(rows) == 0 {
+		rows = append(rows, diffRow{kind: diffRowPlain, code: ""})
+	}
+	return rows
+}
+
+func diffRowsToRawLines(rows []diffRow) []string {
+	lines := make([]string, 0, len(rows))
+	for _, row := range rows {
+		switch row.kind {
+		case diffRowPlain:
+			lines = append(lines, row.code)
+		default:
+			lines = append(lines, row.marker+" "+row.lineNo+" "+row.code)
+		}
+	}
+	return lines
 }
 
 func (m *Model) setDiffText(text string) {
 	m.diffRawLines = strings.Split(text, "\n")
+	m.diffRows = buildPlainDiffRows(m.diffRawLines)
 	m.diffXOffset = 0
-	m.diffChangeRows = collectChangeRows(m.diffRawLines)
+	m.diffChangeRows = collectChangeRowIndexes(m.diffRows)
 	m.refreshDiffViewport()
+}
+
+func (m *Model) renderDiffBody(width int, height int, bg lipgloss.Color) string {
+	bodyWidth := maxInt(width, 1)
+	showScroll := len(m.diffRows) > height
+	contentWidth := bodyWidth
+	if showScroll {
+		contentWidth = maxInt(bodyWidth-1, 1)
+	}
+	start := m.diff.YOffset
+	if start < 0 {
+		start = 0
+	}
+	maxStart := maxInt(len(m.diffRows)-height, 0)
+	if start > maxStart {
+		start = maxStart
+	}
+	lineNoDigits := diffLineNumberDigits(m.diffRows)
+	codeWidth := diffCodeColumnWidth(contentWidth, lineNoDigits)
+	contentLines := make([]string, 0, height)
+	for i := 0; i < height; i++ {
+		idx := start + i
+		if idx >= 0 && idx < len(m.diffRows) {
+			contentLines = append(contentLines, m.renderVisibleDiffRow(m.diffRows[idx], contentWidth, lineNoDigits, codeWidth))
+		} else {
+			contentLines = append(contentLines, strings.Repeat(" ", contentWidth))
+		}
+	}
+	if !showScroll {
+		return strings.Join(contentLines, "\n")
+	}
+
+	scrollRailStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Muted))
+	scrollThumbStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Accent))
+	thumbSize := (height * height) / len(m.diffRows)
+	if thumbSize < 1 {
+		thumbSize = 1
+	}
+	if thumbSize > height {
+		thumbSize = height
+	}
+	thumbMaxStart := height - thumbSize
+	if thumbMaxStart < 0 {
+		thumbMaxStart = 0
+	}
+	thumbStart := 0
+	denom := len(m.diffRows) - height
+	if denom > 0 {
+		thumbStart = (start * thumbMaxStart) / denom
+	}
+	thumbEnd := thumbStart + thumbSize
+
+	b := strings.Builder{}
+	for i := 0; i < height; i++ {
+		b.WriteString(contentLines[i])
+		if i >= thumbStart && i < thumbEnd {
+			b.WriteString(scrollThumbStyle.Render("█"))
+		} else {
+			b.WriteString(scrollRailStyle.Render("│"))
+		}
+		if i < height-1 {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
 }
 
 func (m *Model) refreshDiffViewport() {
 	if m.diff.Width <= 0 {
-		m.diff.SetContent(strings.Join(m.diffRawLines, "\n"))
+		m.diff.SetContent(renderPlainDiffRows(m.diffRows))
 		return
 	}
-	if len(m.diffRawLines) == 0 {
+	if len(m.diffRows) == 0 {
 		m.diff.SetContent("")
 		return
 	}
-	width := m.diff.Width
-	b := strings.Builder{}
-	for i, line := range m.diffRawLines {
-		visible := ansi.Cut(line, m.diffXOffset, m.diffXOffset+width)
-		w := ansi.StringWidth(visible)
-		if w < width {
-			visible = visible + strings.Repeat(" ", width-w)
+	m.diff.SetContent(renderPlainDiffRows(m.diffRows))
+}
+
+func renderPlainDiffRows(rows []diffRow) string {
+	parts := make([]string, 0, len(rows))
+	for _, row := range rows {
+		parts = append(parts, row.code)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func diffLineNumberDigits(rows []diffRow) int {
+	digits := 1
+	for _, row := range rows {
+		if row.kind != diffRowCode {
+			continue
 		}
-		b.WriteString("\x1b[0m" + visible + "\x1b[0m")
-		if i < len(m.diffRawLines)-1 {
-			b.WriteByte('\n')
+		if n := len(strings.TrimSpace(row.lineNo)); n > digits {
+			digits = n
 		}
 	}
-	m.diff.SetContent(b.String())
+	return digits
+}
+
+func diffCodeColumnWidth(totalWidth int, lineNoDigits int) int {
+	const markerWidth = 2
+	gutterWidth := lineNoDigits + 2
+	codeWidth := totalWidth - markerWidth - gutterWidth
+	if codeWidth < 1 {
+		codeWidth = 1
+	}
+	return codeWidth
+}
+
+func collectChangeRowIndexes(rows []diffRow) []int {
+	out := make([]int, 0)
+	for i, row := range rows {
+		if row.isChange {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+func (m *Model) renderVisibleDiffRow(row diffRow, totalWidth int, lineNoDigits int, codeWidth int) string {
+	if row.kind == diffRowPlain {
+		visible := ansi.Cut(row.code, m.diffXOffset, m.diffXOffset+totalWidth)
+		return sanitizeRenderedDiffRow(clampRenderedDiffRow(padStyledCodeSegment("", visible, totalWidth), totalWidth))
+	}
+	if row.kind == diffRowGap {
+		const markerWidth = 2
+		gutterWidth := lineNoDigits + 2
+		markerSeg := strings.Repeat(" ", markerWidth)
+		lineSeg := strings.Repeat(" ", gutterWidth)
+		gapCode := buildGapPattern(codeWidth)
+		codeSeg := renderTintedTextSegment(gapCode, codeWidth, ansiFg(m.colors.Muted), "")
+		return sanitizeRenderedDiffRow(clampRenderedDiffRow(markerSeg+lineSeg+codeSeg, totalWidth))
+	}
+
+	const markerWidth = 2
+	markerBg := row.gutterBg
+	markerText := row.marker
+	if markerText == "" {
+		markerText = " "
+	}
+	markerSeg := renderTintedTextSegment(markerText+" ", markerWidth, row.markerFg, markerBg)
+
+	lineNoText := fmt.Sprintf("%*s ", lineNoDigits, row.lineNo) + ansiFg(m.colors.LineSep) + "│\x1b[39m"
+	lineSeg := renderTintedTextSegment(lineNoText, lineNoDigits+2, ansiFg(m.colors.Muted), row.gutterBg)
+
+	visibleCode := ansi.Cut(row.code, m.diffXOffset, m.diffXOffset+codeWidth)
+	codeSeg := padStyledCodeSegment(row.codeBg, visibleCode, codeWidth)
+	return sanitizeRenderedDiffRow(clampRenderedDiffRow(markerSeg+lineSeg+codeSeg, totalWidth))
+}
+
+func renderTintedTextSegment(text string, width int, fg string, bg string) string {
+	if width <= 0 {
+		return ""
+	}
+	visible := text
+	pad := width - ansi.StringWidth(visible)
+	if pad > 0 {
+		visible += strings.Repeat(" ", pad)
+	}
+	prefix := ""
+	if bg != "" {
+		prefix += bg
+	}
+	if fg != "" {
+		prefix += fg
+	}
+	if prefix == "" {
+		return visible
+	}
+	return prefix + visible + "\x1b[0m"
+}
+
+func padStyledCodeSegment(bg string, visible string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	pad := width - ansi.StringWidth(visible)
+	if pad < 0 {
+		pad = 0
+	}
+	spaces := strings.Repeat(" ", pad)
+	if bg == "" {
+		return visible + spaces
+	}
+	return bg + visible + spaces + "\x1b[0m"
+}
+
+func buildGapPattern(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	pattern := "~"
+	if width == 1 {
+		return pattern
+	}
+	b := strings.Builder{}
+	for ansi.StringWidth(b.String()) < width {
+		b.WriteString(pattern)
+		b.WriteString(" ")
+	}
+	return ansi.Cut(strings.TrimSpace(b.String()), 0, width)
+}
+
+func clampRenderedDiffRow(row string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	clamped := ansi.Cut(row, 0, width)
+	pad := width - ansi.StringWidth(clamped)
+	if pad > 0 {
+		clamped += strings.Repeat(" ", pad)
+	}
+	return clamped
+}
+
+func sanitizeRenderedDiffRow(row string) string {
+	row = strings.ReplaceAll(row, "\r", "")
+	row = strings.ReplaceAll(row, "\n", "")
+	return row
 }
 
 func (m *Model) shiftDiffX(delta int) {
 	if delta == 0 {
 		return
 	}
-	maxWidth := 0
-	for _, line := range m.diffRawLines {
-		w := ansi.StringWidth(line)
-		if w > maxWidth {
-			maxWidth = w
+	lineNoDigits := diffLineNumberDigits(m.diffRows)
+	codeWidth := diffCodeColumnWidth(m.diff.Width, lineNoDigits)
+	maxOffset := 0
+	for _, row := range m.diffRows {
+		visibleWidth := codeWidth
+		if row.kind == diffRowPlain {
+			visibleWidth = m.diff.Width
+		}
+		overflow := ansi.StringWidth(row.code) - visibleWidth
+		if overflow > maxOffset {
+			maxOffset = overflow
 		}
 	}
-	if maxWidth <= m.diff.Width {
+	if maxOffset <= 0 {
 		m.diffXOffset = 0
 		m.refreshDiffViewport()
 		return
@@ -1831,22 +2135,10 @@ func (m *Model) shiftDiffX(delta int) {
 	if m.diffXOffset < 0 {
 		m.diffXOffset = 0
 	}
-	maxOffset := maxWidth - m.diff.Width
 	if m.diffXOffset > maxOffset {
 		m.diffXOffset = maxOffset
 	}
 	m.refreshDiffViewport()
-}
-
-func collectChangeRows(lines []string) []int {
-	out := make([]int, 0)
-	for i, line := range lines {
-		plain := ansi.Strip(line)
-		if strings.HasPrefix(plain, "+ ") || strings.HasPrefix(plain, "- ") || strings.HasPrefix(plain, "~ ") {
-			out = append(out, i)
-		}
-	}
-	return out
 }
 
 func (m *Model) jumpToChange(forward bool) bool {
@@ -1880,19 +2172,12 @@ func (m *Model) renderTreePanel() string {
 		return ""
 	}
 	bg := lipgloss.Color(m.colors.PanelLeftBg)
-	selectedBg := lipgloss.Color(m.colors.PanelRightBg)
-	if m.focus == focusChanges {
-		bg = lipgloss.Color(m.colors.PanelActiveBg)
-		selectedBg = lipgloss.Color(m.colors.Bg)
-	}
 	normalStyle := lipgloss.NewStyle().Background(bg)
-	selectedStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color(m.colors.Accent)).Bold(true)
+	selectedStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Accent)).Bold(true)
 	folderStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Muted))
 	fileStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Fg))
 	scrollRailStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Muted))
 	scrollThumbStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Accent))
-	scrollRailActiveStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color(m.colors.Muted))
-	scrollThumbActiveStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color(m.colors.Accent))
 
 	start := m.leftOffset
 	if start < 0 {
@@ -1955,9 +2240,15 @@ func (m *Model) renderTreePanel() string {
 		}
 		line := truncateText(prefix+status+" "+rowText, contentWidth)
 		if row.kind == treeKindFile {
-			line = strings.Replace(line, status+" ", statusWithColor(status, m.colors)+" ", 1)
+			if i == m.selectedTree {
+				line = m.renderSelectedTreeFileLine(prefix, status, rowText, contentWidth)
+			} else {
+				line = strings.Replace(line, status+" ", statusWithColor(status, m.colors)+" ", 1)
+			}
 		}
-		if i == m.selectedTree {
+		if i == m.selectedTree && row.kind == treeKindFile {
+			b.WriteString(padANSIWidth(line, contentWidth))
+		} else if i == m.selectedTree {
 			b.WriteString(selectedStyle.Width(contentWidth).Render(line))
 		} else if row.kind == treeKindScope || row.kind == treeKindDir {
 			b.WriteString(folderStyle.Width(contentWidth).Render(line))
@@ -1965,16 +2256,10 @@ func (m *Model) renderTreePanel() string {
 			b.WriteString(fileStyle.Width(contentWidth).Render(line))
 		}
 		if showScroll {
-			railStyle := scrollRailStyle
-			thumbStyle := scrollThumbStyle
-			if i == m.selectedTree {
-				railStyle = scrollRailActiveStyle
-				thumbStyle = scrollThumbActiveStyle
-			}
 			if lineRow >= thumbStart && lineRow < thumbEnd {
-				b.WriteString(thumbStyle.Render("█"))
+				b.WriteString(scrollThumbStyle.Render("█"))
 			} else {
-				b.WriteString(railStyle.Render("│"))
+				b.WriteString(scrollRailStyle.Render("│"))
 			}
 		}
 		printed++
@@ -1998,6 +2283,26 @@ func (m *Model) renderTreePanel() string {
 	}
 
 	return b.String()
+}
+
+func (m *Model) renderSelectedTreeFileLine(prefix string, status string, rowText string, width int) string {
+	available := maxInt(width-ansi.StringWidth(prefix)-2, 1)
+	label := truncateText(rowText, available)
+	accent := "\x1b[1;38;2;" + hexToRGBAnsi(m.colors.Accent) + "m"
+	clear := "\x1b[22;39m"
+	line := accent + prefix + clear + statusWithColor(status, m.colors) + accent + label + clear
+	return padANSIWidth(line, width)
+}
+
+func padANSIWidth(input string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	pad := width - ansi.StringWidth(input)
+	if pad <= 0 {
+		return input
+	}
+	return input + strings.Repeat(" ", pad)
 }
 
 func (m *Model) resetSelection() {
@@ -2213,7 +2518,7 @@ func flattenChangeNodeRows(n *treeBuildNode, depth int, parentID string, scope s
 	sort.Strings(folderNames)
 	indent := strings.Repeat("  ", depth)
 	for _, name := range folderNames {
-		child := n.Folders[name]
+		child, label := compactFolderChain(n.Folders[name], scope, collapsed)
 		nodeID := "dir|" + scope + "|" + child.Path
 		expanded := !collapsed[nodeID]
 		icon := "▾"
@@ -2226,7 +2531,7 @@ func flattenChangeNodeRows(n *treeBuildNode, depth int, parentID string, scope s
 			parentID:   parentID,
 			depth:      depth,
 			kind:       treeKindDir,
-			text:       indent + icon + " " + name,
+			text:       indent + icon + " " + label,
 			selectable: true,
 		})
 		if expanded {
@@ -2254,6 +2559,25 @@ func flattenChangeNodeRows(n *treeBuildNode, depth int, parentID string, scope s
 	}
 
 	return rows
+}
+
+func compactFolderChain(n *treeBuildNode, scope string, collapsed map[string]bool) (*treeBuildNode, string) {
+	label := n.Name
+	cur := n
+	for len(cur.Files) == 0 && len(cur.Folders) == 1 && !collapsed["dir|"+scope+"|"+cur.Path] {
+		nextName := ""
+		var next *treeBuildNode
+		for name, child := range cur.Folders {
+			nextName = name
+			next = child
+		}
+		if next == nil || collapsed["dir|"+scope+"|"+next.Path] {
+			break
+		}
+		label += "/" + nextName
+		cur = next
+	}
+	return cur, label
 }
 
 func insertChangeNode(root *treeBuildNode, change model.ChangeItem) {
@@ -2567,25 +2891,52 @@ func renderVerticalSep(height int) string {
 func statusWithColor(status string, colors theme.Tokens) string {
 	switch status {
 	case "A":
-		return "\x1b[38;2;" + hexToRGBAnsi(colors.Added) + "mA\x1b[0m"
+		return ansiFg(colors.Added) + "A\x1b[39m"
 	case "D":
-		return "\x1b[38;2;" + hexToRGBAnsi(colors.Removed) + "mD\x1b[0m"
+		return ansiFg(colors.Removed) + "D\x1b[39m"
 	case "M":
-		return "\x1b[38;2;" + hexToRGBAnsi(colors.Modified) + "mM\x1b[0m"
+		return ansiFg(colors.Modified) + "M\x1b[39m"
 	default:
 		return status
 	}
 }
 
+func ansiFg(hex string) string {
+	return "\x1b[38;2;" + hexToRGBAnsi(hex) + "m"
+}
+
+func ansiBg(hex string) string {
+	return "\x1b[48;2;" + hexToRGBAnsi(hex) + "m"
+}
+
 func hexToRGBAnsi(hex string) string {
-	h := strings.TrimPrefix(strings.TrimSpace(hex), "#")
-	if len(h) != 6 {
+	r, g, b, ok := hexToRGB(hex)
+	if !ok {
 		return "201;209;217"
 	}
-	r := parseHexByte(h[0:2])
-	g := parseHexByte(h[2:4])
-	b := parseHexByte(h[4:6])
 	return fmt.Sprintf("%d;%d;%d", r, g, b)
+}
+
+func darkenHexColor(hex string, factor float64) string {
+	r, g, b, ok := hexToRGB(hex)
+	if !ok {
+		return hex
+	}
+	if factor < 0 {
+		factor = 0
+	}
+	if factor > 1 {
+		factor = 1
+	}
+	return fmt.Sprintf("#%02x%02x%02x", int(float64(r)*factor), int(float64(g)*factor), int(float64(b)*factor))
+}
+
+func hexToRGB(hex string) (int, int, int, bool) {
+	h := strings.TrimPrefix(strings.TrimSpace(hex), "#")
+	if len(h) != 6 {
+		return 0, 0, 0, false
+	}
+	return parseHexByte(h[0:2]), parseHexByte(h[2:4]), parseHexByte(h[4:6]), true
 }
 
 func parseHexByte(v string) int {
@@ -2604,6 +2955,39 @@ func preserveBackgroundAcrossResets(input string) string {
 		return input
 	}
 	return strings.ReplaceAll(input, "\x1b[0m", "\x1b[39m")
+}
+
+func expandTabsANSI(input string, tabWidth int) string {
+	if input == "" || tabWidth <= 0 || !strings.Contains(input, "\t") {
+		return input
+	}
+	b := strings.Builder{}
+	col := 0
+	for i := 0; i < len(input); i++ {
+		if input[i] == '\x1b' && i+1 < len(input) && input[i+1] == '[' {
+			j := i + 2
+			for j < len(input) && input[j] != 'm' {
+				j++
+			}
+			if j < len(input) {
+				b.WriteString(input[i : j+1])
+				i = j
+				continue
+			}
+		}
+		if input[i] == '\t' {
+			spaces := tabWidth - (col % tabWidth)
+			if spaces <= 0 {
+				spaces = tabWidth
+			}
+			b.WriteString(strings.Repeat(" ", spaces))
+			col += spaces
+			continue
+		}
+		b.WriteByte(input[i])
+		col += ansi.StringWidth(string(input[i]))
+	}
+	return b.String()
 }
 
 var scanSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -2744,11 +3128,12 @@ func renderScopeScanPrefix(text string, icon string) string {
 	return icon + " " + text
 }
 
-func (m *Model) renderRecentTabs() string {
+func (m *Model) renderRecentTabs(width int, bg lipgloss.Color) string {
 	filesLabel := "Files"
 	commitsLabel := "Commits"
-	active := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.colors.Accent))
-	inactive := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Muted))
+	active := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.colors.Accent)).Background(bg)
+	inactive := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Muted)).Background(bg)
+	separator := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Muted)).Background(bg).Render(" | ")
 	if m.leftTab == leftTabFiles {
 		filesLabel = active.Render("[" + filesLabel + "]")
 		commitsLabel = inactive.Render("[" + commitsLabel + "]")
@@ -2756,7 +3141,7 @@ func (m *Model) renderRecentTabs() string {
 		filesLabel = inactive.Render("[" + filesLabel + "]")
 		commitsLabel = active.Render("[" + commitsLabel + "]")
 	}
-	return filesLabel + " | " + commitsLabel
+	return lipgloss.NewStyle().Background(bg).Width(width).Render(filesLabel + separator + commitsLabel)
 }
 
 func (m *Model) nextLeftTab() {
@@ -2848,26 +3233,55 @@ func (m *Model) renderCommitPanel() string {
 		end = len(m.rootHistory)
 	}
 	bg := lipgloss.Color(m.colors.PanelLeftBg)
-	selectedBg := lipgloss.Color(m.colors.PanelRightBg)
-	if m.focus == focusChanges {
-		bg = lipgloss.Color(m.colors.PanelActiveBg)
-		selectedBg = lipgloss.Color(m.colors.Bg)
-	}
 	normalStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Fg))
-	selectedStyle := lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color(m.colors.Accent)).Bold(true)
+	selectedStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Accent)).Bold(true)
+	scrollRailStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Muted))
+	scrollThumbStyle := lipgloss.NewStyle().Background(bg).Foreground(lipgloss.Color(m.colors.Accent))
 	b := strings.Builder{}
+	renderWidth := maxInt(m.leftWidth, 8)
+	showScroll := len(m.rootHistory) > m.leftHeight
+	contentWidth := renderWidth
+	thumbStart := 0
+	thumbEnd := 0
+	if showScroll {
+		contentWidth = maxInt(renderWidth-1, 4)
+		thumbSize := (m.leftHeight * m.leftHeight) / len(m.rootHistory)
+		if thumbSize < 1 {
+			thumbSize = 1
+		}
+		if thumbSize > m.leftHeight {
+			thumbSize = m.leftHeight
+		}
+		maxStart := m.leftHeight - thumbSize
+		if maxStart < 0 {
+			maxStart = 0
+		}
+		denom := len(m.rootHistory) - m.leftHeight
+		if denom > 0 {
+			thumbStart = (start * maxStart) / denom
+		}
+		thumbEnd = thumbStart + thumbSize
+	}
 	printed := 0
 	for i := start; i < end; i++ {
+		lineRow := printed
 		commit := m.rootHistory[i]
 		prefix := "  "
 		if i == m.commitCursor {
 			prefix = "❯ "
 		}
-		line := truncateText(prefix+shortHash(commit.Hash)+"  "+commit.Subject, maxInt(m.leftWidth, 8))
+		line := truncateText(prefix+shortHash(commit.Hash)+"  "+commit.Subject, contentWidth)
 		if i == m.commitCursor {
-			b.WriteString(selectedStyle.Width(maxInt(m.leftWidth, 8)).Render(line))
+			b.WriteString(selectedStyle.Width(contentWidth).Render(line))
 		} else {
-			b.WriteString(normalStyle.Width(maxInt(m.leftWidth, 8)).Render(line))
+			b.WriteString(normalStyle.Width(contentWidth).Render(line))
+		}
+		if showScroll {
+			if lineRow >= thumbStart && lineRow < thumbEnd {
+				b.WriteString(scrollThumbStyle.Render("█"))
+			} else {
+				b.WriteString(scrollRailStyle.Render("│"))
+			}
 		}
 		printed++
 		if printed < m.leftHeight {
@@ -2878,7 +3292,14 @@ func (m *Model) renderCommitPanel() string {
 		if printed > 0 {
 			b.WriteByte('\n')
 		}
-		b.WriteString(normalStyle.Width(maxInt(m.leftWidth, 8)).Render(""))
+		b.WriteString(normalStyle.Width(contentWidth).Render(""))
+		if showScroll {
+			if printed >= thumbStart && printed < thumbEnd {
+				b.WriteString(scrollThumbStyle.Render("█"))
+			} else {
+				b.WriteString(scrollRailStyle.Render("│"))
+			}
+		}
 		printed++
 	}
 	return b.String()

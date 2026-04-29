@@ -95,12 +95,14 @@ colors:
 - `q` / `ctrl+c`: quit
 - `tab`: switch focus between change list and diff pane
 - `j` / `k` or arrows: move selection
-- `left` / `h` (tree pane): collapse folder or move up
+- `left` / `h` (tree pane): collapse folder or move left
 - `right` / `l` (tree pane): expand folder
 - `space` (tree pane): toggle folder collapse
 - `x` / `X` (tree pane): collapse all / expand all
 - `enter`: reload diff for current selection
-- `h` (diff pane): toggle full-file vs hunks-only view (hunks show +/- 5 context lines)
+- `left` / `h` (diff pane): pan left
+- `right` / `l` (diff pane): pan right
+- `f` (diff pane): toggle full-file vs hunks-only view (hunks show +/- 5 context lines)
 - `s`: toggle staged changes
 - `u`: toggle unstaged changes
 - `n`: toggle untracked changes
