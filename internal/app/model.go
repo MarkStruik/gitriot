@@ -33,6 +33,9 @@ const (
 type Option struct {
 	RepoPath     string
 	Theme        theme.FileTheme
+	ThemeName    string
+	Themes       []theme.NamedTheme
+	SaveTheme    func(string) error
 	RecentWindow time.Duration
 	SinceCommit  string
 }
@@ -81,17 +84,27 @@ type Model struct {
 	scanSpinner   int
 	scanRequestID int
 
-	diff         viewport.Model
-	help         help.Model
-	search       textinput.Model
-	focus        paneFocus
-	showKeybinds bool
+	diff            viewport.Model
+	help            help.Model
+	search          textinput.Model
+	themeSearch     textinput.Model
+	focus           paneFocus
+	showKeybinds    bool
+	showThemePicker bool
 
-	treeRows     []treeRow
-	selectedTree int
-	leftOffset   int
-	leftWidth    int
-	leftHeight   int
+	treeRows         []treeRow
+	selectedTree     int
+	leftOffset       int
+	leftWidth        int
+	leftHeight       int
+	themeCursor      int
+	themeList        []theme.NamedTheme
+	allThemes        []theme.NamedTheme
+	currentTheme     theme.FileTheme
+	currentThemeName string
+	saveTheme        func(string) error
+	pickerThemeName  string
+	pickerTheme      theme.FileTheme
 
 	width  int
 	height int
@@ -241,6 +254,7 @@ type keyMap struct {
 	PrevChange      key.Binding
 	Search          key.Binding
 	ToggleRecent    key.Binding
+	ThemePicker     key.Binding
 	ShowKeybinds    key.Binding
 	CloseSearch     key.Binding
 	Up              key.Binding
@@ -257,7 +271,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.FocusSwitch},
 		{k.FilterStaged, k.FilterUnstaged, k.FilterUntracked, k.FilterSubmodule, k.ToggleHunksOnly},
-		{k.ToggleRecent, k.Search, k.CloseSearch, k.Refresh, k.Quit},
+		{k.ToggleRecent, k.ThemePicker, k.Search, k.CloseSearch, k.Refresh, k.Quit},
 	}
 }
 
@@ -281,6 +295,7 @@ var keys = keyMap{
 	NextChange:      key.NewBinding(key.WithKeys("}"), key.WithHelp("}", "next change")),
 	PrevChange:      key.NewBinding(key.WithKeys("{"), key.WithHelp("{", "prev change")),
 	ToggleRecent:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "current only")),
+	ThemePicker:     key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "themes")),
 	ShowKeybinds:    key.NewBinding(key.WithKeys("?", "f1"), key.WithHelp("?", "key help")),
 	Search:          key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
 	CloseSearch:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "close search")),
@@ -300,37 +315,48 @@ func NewModel(opt Option) Model {
 	s.Placeholder = "path or submodule"
 	s.Blur()
 
+	ts := textinput.New()
+	ts.Prompt = "theme> "
+	ts.Placeholder = "filter themes"
+	ts.Blur()
+
 	h := help.New()
 	h.ShowAll = false
 
 	return Model{
-		repoPath:      filepath.Clean(opt.RepoPath),
-		rootName:      filepath.Base(filepath.Clean(opt.RepoPath)),
-		styles:        ui.NewStyles(opt.Theme),
-		colors:        opt.Theme.Colors,
-		filters:       DefaultFilters(),
-		runner:        runner,
-		index:         git.NewRepositoryIndexer(runner),
-		diffs:         git.NewDiffLoader(runner),
-		diff:          d,
-		help:          h,
-		search:        s,
-		focus:         focusChanges,
-		message:       "Loading repository status...",
-		recentWindow:  opt.RecentWindow,
-		sinceCommit:   strings.TrimSpace(opt.SinceCommit),
-		useSinceMode:  strings.TrimSpace(opt.SinceCommit) != "",
-		showRecent:    strings.TrimSpace(opt.SinceCommit) != "",
-		showHunksOnly: true,
-		anchorIndex:   0,
-		anchorHash:    strings.TrimSpace(opt.SinceCommit),
-		selectedTree:  -1,
-		scopeBranches: map[string]string{},
-		treeCollapsed: map[string]bool{},
-		leftTab:       leftTabFiles,
-		commitCursor:  0,
-		commitOffset:  0,
-		workingKeys:   map[string]struct{}{},
+		repoPath:         filepath.Clean(opt.RepoPath),
+		rootName:         filepath.Base(filepath.Clean(opt.RepoPath)),
+		styles:           ui.NewStyles(opt.Theme),
+		colors:           opt.Theme.Colors,
+		currentTheme:     opt.Theme,
+		currentThemeName: strings.TrimSpace(opt.ThemeName),
+		filters:          DefaultFilters(),
+		runner:           runner,
+		index:            git.NewRepositoryIndexer(runner),
+		diffs:            git.NewDiffLoader(runner),
+		diff:             d,
+		help:             h,
+		search:           s,
+		themeSearch:      ts,
+		focus:            focusChanges,
+		message:          "Loading repository status...",
+		recentWindow:     opt.RecentWindow,
+		sinceCommit:      strings.TrimSpace(opt.SinceCommit),
+		useSinceMode:     strings.TrimSpace(opt.SinceCommit) != "",
+		showRecent:       strings.TrimSpace(opt.SinceCommit) != "",
+		showHunksOnly:    true,
+		anchorIndex:      0,
+		anchorHash:       strings.TrimSpace(opt.SinceCommit),
+		selectedTree:     -1,
+		scopeBranches:    map[string]string{},
+		treeCollapsed:    map[string]bool{},
+		leftTab:          leftTabFiles,
+		commitCursor:     0,
+		commitOffset:     0,
+		workingKeys:      map[string]struct{}{},
+		allThemes:        append([]theme.NamedTheme(nil), opt.Themes...),
+		themeList:        append([]theme.NamedTheme(nil), opt.Themes...),
+		saveTheme:        opt.SaveTheme,
 		scanStates: []scanState{{
 			path:   "root",
 			label:  "root",
@@ -358,6 +384,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	}
+
+	if m.showThemePicker {
+		var cmd tea.Cmd
+		m.themeSearch, cmd = m.themeSearch.Update(msg)
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch {
+			case key.Matches(keyMsg, keys.CloseSearch), key.Matches(keyMsg, keys.ThemePicker):
+				m.closeThemePicker(false)
+				return m, nil
+			case keyMsg.Type == tea.KeyEnter:
+				m.closeThemePicker(true)
+				return m, nil
+			case key.Matches(keyMsg, keys.Up):
+				m.moveThemeSelection(-1)
+				return m, nil
+			case key.Matches(keyMsg, keys.Down):
+				m.moveThemeSelection(1)
+				return m, nil
+			case key.Matches(keyMsg, keys.PageUp):
+				m.moveThemeSelection(-5)
+				return m, nil
+			case key.Matches(keyMsg, keys.PageDown):
+				m.moveThemeSelection(5)
+				return m, nil
+			default:
+				m.filterThemeList(m.themeSearch.Value())
+				return m, cmd
+			}
+		}
+		m.filterThemeList(m.themeSearch.Value())
+		return m, cmd
 	}
 
 	if m.focus == focusSearch {
@@ -628,6 +686,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmd, m.loadIndexCmd())
 			}
 			return m, m.loadIndexCmd()
+		case key.Matches(msg, keys.ThemePicker):
+			m.openThemePicker()
+			return m, textinput.Blink
 		case key.Matches(msg, keys.PrevAnchor):
 			if m.focus != focusChanges {
 				return m, nil
@@ -902,6 +963,9 @@ func (m Model) View() string {
 		search := m.styles.SearchPrompt.Render("Search: ") + m.search.View()
 		base = lipgloss.JoinVertical(lipgloss.Left, base, search)
 	}
+	if m.showThemePicker {
+		base = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderThemePickerModal(), lipgloss.WithWhitespaceBackground(lipgloss.Color(m.colors.Bg)))
+	}
 	if m.showKeybinds {
 		base = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderKeybindModal(), lipgloss.WithWhitespaceBackground(lipgloss.Color(m.colors.Bg)))
 	}
@@ -1035,6 +1099,9 @@ func (m *Model) activeKeybindSummary() string {
 	if m.focus == focusSearch {
 		return "SEARCH  type filter  enter apply  esc close"
 	}
+	if m.showThemePicker {
+		return "THEMES  ↑/↓ preview  enter apply  esc cancel"
+	}
 	if m.focus == focusDiff {
 		return "DIFF  f hunks/full  { prev change  } next change  h/← pan left  l/→ pan right"
 	}
@@ -1051,11 +1118,12 @@ func (m *Model) renderKeybindModal() string {
 	content := strings.Join([]string{
 		"Keybindings",
 		"",
-		"Global: q quit | tab switch pane | r refresh | / search | c current only | ? help",
+		"Global: q quit | tab switch pane | r refresh | / search | t themes | c current only | ? help",
 		"Tree:   ↑/↓ move | enter toggle folder | ←/h collapse | →/l expand | space toggle | x/X all",
 		"Tabs:   [ prev tab | ] next tab | Commits tab: enter apply anchor and switch to Files",
 		"Mode:   c return to current-only view (live updates enabled)",
 		"Diff:   f hunks/full | { prev change | } next change | h/← pan left | l/→ pan right",
+		"Themes: t open picker | type filter | ↑/↓ preview | enter apply | esc cancel",
 		"Search: type query | enter apply | esc close",
 		"",
 		"Press ? or esc to close",
@@ -1070,6 +1138,144 @@ func (m *Model) renderKeybindModal() string {
 		Width(maxInt(minInt(m.width-8, 120), 40)).
 		Render(content)
 	return box
+}
+
+func (m *Model) renderThemePickerModal() string {
+	lines := []string{"Themes", "", m.styles.SearchPrompt.Render("Search: ") + m.themeSearch.View(), ""}
+	if len(m.themeList) == 0 {
+		lines = append(lines, m.styles.Muted.Render("No themes match filter"))
+	} else {
+		start := 0
+		if m.themeCursor >= 8 {
+			start = m.themeCursor - 7
+		}
+		end := minInt(start+10, len(m.themeList))
+		for i := start; i < end; i++ {
+			entry := m.themeList[i]
+			prefix := "  "
+			style := lipgloss.NewStyle().Foreground(lipgloss.Color(m.colors.Fg))
+			if i == m.themeCursor {
+				prefix = "❯ "
+				style = style.Bold(true).Foreground(lipgloss.Color(m.colors.Accent))
+			}
+			label := entry.Name
+			if entry.Kind != "" {
+				label += "  [" + entry.Kind + "]"
+			}
+			lines = append(lines, style.Render(prefix+label))
+		}
+	}
+	lines = append(lines, "", m.styles.Muted.Render("Enter apply and save | Esc cancel and revert"))
+	content := strings.Join(lines, "\n")
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(m.colors.Accent)).
+		Background(lipgloss.Color(m.colors.PanelRightBg)).
+		Foreground(lipgloss.Color(m.colors.Fg)).
+		Padding(1, 2).
+		Width(maxInt(minInt(m.width-8, 72), 36)).
+		Render(content)
+}
+
+func (m *Model) openThemePicker() {
+	m.showThemePicker = true
+	m.themeSearch.SetValue("")
+	m.themeSearch.Focus()
+	if strings.TrimSpace(m.currentThemeName) == "" && m.currentTheme.Name != "" {
+		m.currentThemeName = m.currentTheme.Name
+	}
+	m.pickerTheme = m.currentTheme
+	m.pickerThemeName = m.currentThemeName
+	m.filterThemeList("")
+	m.previewSelectedTheme()
+}
+
+func (m *Model) closeThemePicker(apply bool) {
+	m.showThemePicker = false
+	m.themeSearch.Blur()
+	if !apply {
+		m.applyTheme(m.pickerThemeName, m.pickerTheme)
+		m.message = "Theme preview cancelled"
+		return
+	}
+	if len(m.themeList) == 0 {
+		m.applyTheme(m.pickerThemeName, m.pickerTheme)
+		m.message = "No theme selected"
+		return
+	}
+	entry := m.themeList[m.themeCursor]
+	m.applyTheme(entry.Name, entry.Theme)
+	if m.saveTheme != nil {
+		if err := m.saveTheme(entry.Name); err != nil {
+			m.warn = append(m.warn, "save theme failed: "+err.Error())
+			m.message = "Theme applied, but config save failed"
+			return
+		}
+	}
+	m.message = "Theme applied: " + entry.Name
+}
+
+func (m *Model) filterThemeList(query string) {
+	q := strings.ToLower(strings.TrimSpace(query))
+	filtered := make([]theme.NamedTheme, 0, len(m.allThemes))
+	for _, entry := range m.allThemes {
+		hay := strings.ToLower(entry.Name + " " + entry.Kind + " " + entry.Theme.Name)
+		if q != "" && !strings.Contains(hay, q) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	m.themeList = filtered
+	if len(filtered) == 0 {
+		m.themeCursor = 0
+		m.applyTheme(m.pickerThemeName, m.pickerTheme)
+		return
+	}
+	for i, entry := range filtered {
+		if entry.Name == m.currentThemeName {
+			m.themeCursor = i
+			m.previewSelectedTheme()
+			return
+		}
+	}
+	if m.themeCursor >= len(filtered) {
+		m.themeCursor = len(filtered) - 1
+		if m.themeCursor < 0 {
+			m.themeCursor = 0
+		}
+	}
+	m.previewSelectedTheme()
+}
+
+func (m *Model) moveThemeSelection(delta int) {
+	if len(m.themeList) == 0 || delta == 0 {
+		return
+	}
+	m.themeCursor += delta
+	if m.themeCursor < 0 {
+		m.themeCursor = 0
+	}
+	if m.themeCursor >= len(m.themeList) {
+		m.themeCursor = len(m.themeList) - 1
+	}
+	m.previewSelectedTheme()
+}
+
+func (m *Model) previewSelectedTheme() {
+	if len(m.themeList) == 0 || m.themeCursor < 0 || m.themeCursor >= len(m.themeList) {
+		return
+	}
+	entry := m.themeList[m.themeCursor]
+	m.applyTheme(entry.Name, entry.Theme)
+	m.message = "Previewing theme: " + entry.Name
+}
+
+func (m *Model) applyTheme(name string, selected theme.FileTheme) {
+	m.currentTheme = selected
+	m.currentThemeName = name
+	m.colors = selected.Colors
+	m.styles = ui.NewStyles(selected)
+	m.refreshDiffViewport()
 }
 
 func (m *Model) loadIndexCmd() tea.Cmd {
@@ -1308,10 +1514,17 @@ func (m *Model) applyMergedFilesToList(previousSelectionID string) {
 		key := m.treeRows[i].change.ScopeLabel() + "|" + m.treeRows[i].change.Path
 		if file, ok := fileMap[key]; ok {
 			fileCopy := file
+			if _, isWorkingFile := m.workingKeys[key]; !isWorkingFile {
+				m.treeRows[i].id = commitFileSelectionID(file)
+			}
 			m.treeRows[i].commitFile = &fileCopy
 		}
 	}
 	m.restoreSelection(previousSelectionID)
+}
+
+func commitFileSelectionID(file model.CommitFile) string {
+	return "commitfile|" + file.Scope + "|" + file.CommitHash + "|" + file.Path
 }
 
 func (m *Model) selectedItem() *model.ChangeItem {
@@ -2008,33 +2221,45 @@ func collectChangeRowIndexes(rows []diffRow) []int {
 }
 
 func (m *Model) renderVisibleDiffRow(row diffRow, totalWidth int, lineNoDigits int, codeWidth int) string {
+	defaultBg := ansiBg(m.colors.PanelRightBg)
 	if row.kind == diffRowPlain {
 		visible := ansi.Cut(row.code, m.diffXOffset, m.diffXOffset+totalWidth)
-		return sanitizeRenderedDiffRow(clampRenderedDiffRow(padStyledCodeSegment("", visible, totalWidth), totalWidth))
+		return sanitizeRenderedDiffRow(clampRenderedDiffRow(padStyledCodeSegment(defaultBg, visible, totalWidth), totalWidth))
 	}
 	if row.kind == diffRowGap {
 		const markerWidth = 2
 		gutterWidth := lineNoDigits + 2
-		markerSeg := strings.Repeat(" ", markerWidth)
-		lineSeg := strings.Repeat(" ", gutterWidth)
+		markerSeg := renderTintedTextSegment("", markerWidth, "", defaultBg)
+		lineSeg := renderTintedTextSegment("", gutterWidth, "", defaultBg)
 		gapCode := buildGapPattern(codeWidth)
-		codeSeg := renderTintedTextSegment(gapCode, codeWidth, ansiFg(m.colors.Muted), "")
+		codeSeg := renderTintedTextSegment(gapCode, codeWidth, ansiFg(m.colors.Muted), defaultBg)
 		return sanitizeRenderedDiffRow(clampRenderedDiffRow(markerSeg+lineSeg+codeSeg, totalWidth))
 	}
 
 	const markerWidth = 2
 	markerBg := row.gutterBg
+	if markerBg == "" {
+		markerBg = defaultBg
+	}
 	markerText := row.marker
 	if markerText == "" {
 		markerText = " "
 	}
 	markerSeg := renderTintedTextSegment(markerText+" ", markerWidth, row.markerFg, markerBg)
 
+	gutterBg := row.gutterBg
+	if gutterBg == "" {
+		gutterBg = defaultBg
+	}
 	lineNoText := fmt.Sprintf("%*s ", lineNoDigits, row.lineNo) + ansiFg(m.colors.LineSep) + "│\x1b[39m"
-	lineSeg := renderTintedTextSegment(lineNoText, lineNoDigits+2, ansiFg(m.colors.Muted), row.gutterBg)
+	lineSeg := renderTintedTextSegment(lineNoText, lineNoDigits+2, ansiFg(m.colors.Muted), gutterBg)
 
+	codeBg := row.codeBg
+	if codeBg == "" {
+		codeBg = defaultBg
+	}
 	visibleCode := ansi.Cut(row.code, m.diffXOffset, m.diffXOffset+codeWidth)
-	codeSeg := padStyledCodeSegment(row.codeBg, visibleCode, codeWidth)
+	codeSeg := padStyledCodeSegment(codeBg, visibleCode, codeWidth)
 	return sanitizeRenderedDiffRow(clampRenderedDiffRow(markerSeg+lineSeg+codeSeg, totalWidth))
 }
 
@@ -2072,6 +2297,7 @@ func padStyledCodeSegment(bg string, visible string, width int) string {
 	if bg == "" {
 		return visible + spaces
 	}
+	visible = preserveBackgroundAcrossResets(visible)
 	return bg + visible + spaces + "\x1b[0m"
 }
 
@@ -2954,7 +3180,8 @@ func preserveBackgroundAcrossResets(input string) string {
 	if input == "" {
 		return input
 	}
-	return strings.ReplaceAll(input, "\x1b[0m", "\x1b[39m")
+	input = strings.ReplaceAll(input, "\x1b[0m", "\x1b[39m")
+	return strings.ReplaceAll(input, "\x1b[m", "\x1b[39m")
 }
 
 func expandTabsANSI(input string, tabWidth int) string {

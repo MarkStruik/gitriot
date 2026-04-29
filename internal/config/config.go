@@ -63,3 +63,17 @@ func DefaultConfig() Config {
 func ThemePath(paths Paths, themeName string) string {
 	return filepath.Join(paths.ThemesDir, themeName+".yaml")
 }
+
+func Save(paths Paths, cfg Config) error {
+	if err := os.MkdirAll(paths.HomeConfigDir, 0o755); err != nil {
+		return fmt.Errorf("create config dir %q failed: %w", paths.HomeConfigDir, err)
+	}
+	raw, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config failed: %w", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, raw, 0o644); err != nil {
+		return fmt.Errorf("write config %q failed: %w", paths.ConfigFile, err)
+	}
+	return nil
+}

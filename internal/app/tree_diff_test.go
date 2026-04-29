@@ -32,6 +32,45 @@ func TestBuildChangeTreeRowsCompactsSingleChildFolders(t *testing.T) {
 	}
 }
 
+func TestApplyMergedFilesUsesCommitSelectionIDForCommitOnlyRows(t *testing.T) {
+	m := Model{
+		filters:       DefaultFilters(),
+		scopeBranches: map[string]string{"root": "main"},
+		treeCollapsed: map[string]bool{},
+		showRecent:    true,
+		recentFiles: []model.CommitFile{
+			{Scope: "root", CommitHash: "abc123", Path: "same.go", Status: "M", IsRoot: true},
+		},
+	}
+	m.lastSelID = "file|root|unstaged|same.go"
+
+	m.applyMergedFilesToList("")
+
+	if len(m.treeRows) == 0 {
+		t.Fatal("expected tree rows")
+	}
+	var fileRow *treeRow
+	for i := range m.treeRows {
+		if m.treeRows[i].kind == treeKindFile {
+			fileRow = &m.treeRows[i]
+			break
+		}
+	}
+	if fileRow == nil {
+		t.Fatal("expected a file row")
+	}
+	if fileRow.id == m.lastSelID {
+		t.Fatalf("commit row selection id should not match current-change id %q", m.lastSelID)
+	}
+	want := "commitfile|root|abc123|same.go"
+	if fileRow.id != want {
+		t.Fatalf("expected commit selection id %q, got %q", want, fileRow.id)
+	}
+	if fileRow.commitFile == nil {
+		t.Fatal("expected commit metadata on commit-only row")
+	}
+}
+
 func TestRenderNumberedLinesHighlightsPartialChangedRows(t *testing.T) {
 	m := Model{colors: theme.Default.Colors}
 	decor := map[int]git.LineDecoration{

@@ -50,3 +50,22 @@ func TestLoadParsesConfig(t *testing.T) {
 		t.Fatalf("expected explicit theme file, got %q", cfg.ThemeFile)
 	}
 }
+
+func TestSaveWritesConfig(t *testing.T) {
+	base := t.TempDir()
+	paths := Paths{
+		HomeConfigDir: base,
+		ConfigFile:    filepath.Join(base, "config.yaml"),
+		ThemesDir:     filepath.Join(base, "themes"),
+	}
+	if err := Save(paths, Config{Theme: "forest"}); err != nil {
+		t.Fatalf("save config failed: %v", err)
+	}
+	cfg, err := Load(paths)
+	if err != nil {
+		t.Fatalf("reload config failed: %v", err)
+	}
+	if cfg.Theme != "forest" {
+		t.Fatalf("expected saved theme forest, got %q", cfg.Theme)
+	}
+}

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"gitriot/internal/app"
@@ -14,12 +16,20 @@ import (
 
 func main() {
 	repoFlag := flag.String("repo", ".", "Path to repository root")
-	themeFlag := flag.String("theme", "", "Theme name from ~/.gitriot/themes")
+	themeFlag := flag.String("theme", "", "Theme name from built-ins or ~/.gitriot/themes")
 	themeFileFlag := flag.String("theme-file", "", "Absolute path to theme YAML file")
+	listThemesFlag := flag.Bool("list-themes", false, "List built-in theme names and exit")
 	recentWindowFlag := flag.Duration("recent-window", 0, "Time window around root last commit (example: 90m, 2h)")
 	sinceCommitFlag := flag.String("since-commit", "", "Root commit hash (partial or full): show changes from that commit timestamp to now")
 	noAltScreenFlag := flag.Bool("no-alt-screen", false, "Disable alternate screen mode (useful for embedded terminals)")
 	flag.Parse()
+
+	if *listThemesFlag {
+		for _, name := range theme.BuiltinNames() {
+			fmt.Println(name)
+		}
+		return
+	}
 
 	paths, err := config.ResolvePaths()
 	if err != nil {
@@ -45,13 +55,26 @@ func main() {
 	if *themeFileFlag != "" {
 		themePath = *themeFileFlag
 	}
-	if themePath == "" {
-		themePath = config.ThemePath(paths, themeName)
-	}
 
 	selectedTheme := theme.Default
-	if loaded, err := theme.LoadFromFile(themePath); err == nil {
+	if themePath != "" {
+		loaded, err := theme.LoadFromFile(themePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load theme file: %v\n", err)
+			os.Exit(1)
+		}
 		selectedTheme = loaded
+	} else {
+		candidatePath := config.ThemePath(paths, themeName)
+		if loaded, err := theme.LoadFromFile(candidatePath); err == nil {
+			selectedTheme = loaded
+		} else if builtin, ok := theme.LookupBuiltin(themeName); ok {
+			selectedTheme = builtin
+		} else {
+			fmt.Fprintf(os.Stderr, "unknown theme %q\n", themeName)
+			fmt.Fprintf(os.Stderr, "use --list-themes to see built-in theme names\n")
+			os.Exit(1)
+		}
 	}
 
 	repoPath, err := filepath.Abs(*repoFlag)
@@ -66,8 +89,15 @@ func main() {
 	}
 
 	modelOption := app.Option{
-		RepoPath:     repoPath,
-		Theme:        selectedTheme,
+		RepoPath:  repoPath,
+		Theme:     selectedTheme,
+		ThemeName: themeName,
+		Themes:    availableThemes(paths),
+		SaveTheme: func(name string) error {
+			cfg.Theme = name
+			cfg.ThemeFile = ""
+			return config.Save(paths, cfg)
+		},
 		RecentWindow: *recentWindowFlag,
 		SinceCommit:  *sinceCommitFlag,
 	}
@@ -92,4 +122,36 @@ func isEmbeddedTerminal() bool {
 
 	v = os.Getenv("TERM_PROGRAM")
 	return v == "JetBrains-JediTerm"
+}
+
+func availableThemes(paths config.Paths) []theme.NamedTheme {
+	byName := map[string]theme.NamedTheme{}
+	for _, builtin := range theme.Builtins() {
+		byName[builtin.Name] = builtin
+	}
+	entries, err := os.ReadDir(paths.ThemesDir)
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".yaml") {
+				continue
+			}
+			name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+			loaded, loadErr := theme.LoadFromFile(filepath.Join(paths.ThemesDir, entry.Name()))
+			if loadErr != nil {
+				continue
+			}
+			loaded.Name = name
+			byName[name] = theme.NamedTheme{Name: name, Theme: loaded, Kind: "custom"}
+		}
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]theme.NamedTheme, 0, len(names))
+	for _, name := range names {
+		out = append(out, byName[name])
+	}
+	return out
 }

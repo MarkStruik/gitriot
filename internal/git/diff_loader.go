@@ -160,7 +160,10 @@ func (d *DiffLoader) LoadHeadFile(ctx context.Context, req SinceDiffRequest) (st
 }
 
 func (d *DiffLoader) baseCommitBefore(ctx context.Context, workingDir string, since time.Time) (string, error) {
-	out, err := d.runner.Run(ctx, workingDir, "rev-list", "-n", "1", "--before="+since.UTC().Format(time.RFC3339), "HEAD")
+	// Git's --before/--until matching includes commits at the exact second. Use
+	// the previous second so the selected anchor commit remains part of the range.
+	exclusiveBefore := since.UTC().Add(-time.Second)
+	out, err := d.runner.Run(ctx, workingDir, "rev-list", "-n", "1", "--before="+exclusiveBefore.Format(time.RFC3339), "HEAD")
 	if err != nil {
 		return "", err
 	}

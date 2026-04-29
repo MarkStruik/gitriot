@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -57,6 +58,7 @@ func TestRenderDiffBodyForModelFixtureHasExpectedVisibleRows(t *testing.T) {
 	}
 
 	content := string(raw)
+	rawLines := strings.Split(content, "\n")
 	decor := map[int]git.LineDecoration{
 		108: {Added: true},
 		114: {Added: true},
@@ -73,27 +75,27 @@ func TestRenderDiffBodyForModelFixtureHasExpectedVisibleRows(t *testing.T) {
 	if len(lines) != 22 {
 		t.Fatalf("expected 22 visible lines, got %d\n%s", len(lines), strings.Join(lines, "\n"))
 	}
-
-	assertLineSequence(t, lines, []string{
-		"Path: root/internal/app/model.go",
-		"",
-		"~ ~ ~",
-		"103 │",
-		"104 │    requestID       int",
-		"105 │    lastSelID       string",
-		"106 │    activeRef       string",
-		"107 │    lastFingerprint string",
-		"+ 108 │    diffRows        []diffRow",
-		"109 │    diffRawLines    []string",
-		"110 │    diffXOffset     int",
-		"111 │    diffChangeRows  []int",
-		"112 │}",
-		"113 │",
-		"+ 114 │type diffRowKind int",
-		"115 │",
-		"116 │const (",
-		"+ 117 │    diffRowPlain diffRowKind = iota",
-	})
+	if !strings.Contains(lines[0], "Path: root/internal/app/model.go") {
+		t.Fatalf("expected path header on first line, got %q", lines[0])
+	}
+	if !strings.Contains(lines[2], "~ ~ ~") {
+		t.Fatalf("expected hunk gap indicator, got %q", lines[2])
+	}
+	markerByLine := map[int]string{108: "+", 114: "+", 117: "+"}
+	for idx, lineNo := range []int{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121} {
+		line := normalizeComparisonLine(lines[idx+3])
+		wantPrefix := fmt.Sprintf("%d │", lineNo)
+		if marker, ok := markerByLine[lineNo]; ok {
+			wantPrefix = fmt.Sprintf("%s %d │", marker, lineNo)
+		}
+		if !strings.Contains(line, wantPrefix) {
+			t.Fatalf("expected line %d to contain %q, got %q", lineNo, wantPrefix, line)
+		}
+		rawText := strings.TrimLeft(rawLines[lineNo-1], "\t ")
+		if rawText != "" && !strings.Contains(line, normalizeComparisonLine(rawText)) {
+			t.Fatalf("expected line %d to contain source text %q, got %q", lineNo, rawText, line)
+		}
+	}
 
 	for i := 1; i < len(lines); i++ {
 		prev := strings.TrimSpace(lines[i-1])
@@ -130,6 +132,30 @@ func TestRenderDiffBodyForModelFixtureHasExpectedVisibleRows(t *testing.T) {
 	}
 }
 
+func TestRenderVisibleDiffRowUsesThemeBackgroundForHighlightedCode(t *testing.T) {
+	colors := theme.Default.Colors
+	colors.PanelRightBg = "#123456"
+	m := Model{colors: colors}
+	m.diff.Width = 80
+	row := diffRow{
+		kind:   diffRowCode,
+		lineNo: "1",
+		code:   "\x1b[38;2;255;0;0mfunc\x1b[0m value",
+	}
+
+	rendered := m.renderVisibleDiffRow(row, 80, 1, 75)
+	wantBg := ansiBg(colors.PanelRightBg)
+	if !strings.Contains(rendered, wantBg) {
+		t.Fatalf("expected themed background %q in rendered row %q", wantBg, rendered)
+	}
+	if strings.Contains(rendered, "\x1b[0m value") {
+		t.Fatalf("expected reset inside highlighted code to preserve background, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "\x1b[39m value") {
+		t.Fatalf("expected foreground reset inside highlighted code, got %q", rendered)
+	}
+}
+
 func stripRenderedLines(input string) []string {
 	rawLines := strings.Split(input, "\n")
 	out := make([]string, 0, len(rawLines))
@@ -138,28 +164,6 @@ func stripRenderedLines(input string) []string {
 	}
 	return out
 }
-
-func assertLineSequence(t *testing.T, lines []string, expected []string) {
-	t.Helper()
-	start := -1
-	for i := 0; i < len(lines)-len(expected)+1; i++ {
-		match := true
-		for j := range expected {
-			if !strings.Contains(normalizeComparisonLine(lines[i+j]), normalizeComparisonLine(expected[j])) {
-				match = false
-				break
-			}
-		}
-		if match {
-			start = i
-			break
-		}
-	}
-	if start == -1 {
-		t.Fatalf("expected sequence not found in rendered lines:\n%s", strings.Join(lines, "\n"))
-	}
-}
-
 func normalizeComparisonLine(input string) string {
 	return strings.ReplaceAll(input, "\t", "    ")
 }
