@@ -14,15 +14,23 @@ import (
 	"gitriot/internal/theme"
 )
 
+var version = "dev"
+
 func main() {
 	repoFlag := flag.String("repo", ".", "Path to repository root")
 	themeFlag := flag.String("theme", "", "Theme name from built-ins or ~/.gitriot/themes")
 	themeFileFlag := flag.String("theme-file", "", "Absolute path to theme YAML file")
 	listThemesFlag := flag.Bool("list-themes", false, "List built-in theme names and exit")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	recentWindowFlag := flag.Duration("recent-window", 0, "Time window around root last commit (example: 90m, 2h)")
 	sinceCommitFlag := flag.String("since-commit", "", "Root commit hash (partial or full): show changes from that commit timestamp to now")
 	noAltScreenFlag := flag.Bool("no-alt-screen", false, "Disable alternate screen mode (useful for embedded terminals)")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println(version)
+		return
+	}
 
 	if *listThemesFlag {
 		for _, name := range theme.BuiltinNames() {
